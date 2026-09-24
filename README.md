@@ -18,19 +18,20 @@ What we mean by "fast":
  * Operations that can't be instantaneous (loading debug info, searching for functions and types) should be reasonably efficient, multi-threaded, asynchronous, cancellable, and have progress bars.
 
 Limitations:
- * Linux only
- * x86 only
+ * Linux only (host); remote GDB-stub targets may be other architectures
+ * x86-64 only for native ptrace debugging; remote mode accepts x86-64, aarch64, and riscv64 guests
  * 64-bit only
  * for native code only (e.g. C++, Rust, Zig, Odin, not Java or Python)
  * TUI only (no REPL, GUI, or IDE integration)
- * no remote debugging (but works fine over ssh)
+ * no remote *process* debugging over the network for local ptrace targets (works fine over ssh); GDB remote stub attach via `--remote host:port` (e.g. after `qemu-system-… -s -S`)
  * single process (doesn't follow forks)
  * no record/replay or backwards stepping
+ * disassembly uses binutils libopcodes (same engine as GDB), not a hand-rolled decoder
 
 Development status:
  * Most standard debugger features are there. E.g. breakpoints, conditional breakpoints, data breakpoints, stepping of all kinds, showing code and disassembly, watch expressions, built-in pretty-printers for most of C++ and Rust standard library. Many quality-of-life features are there (e.g. auto-downcasting abstract classes to concrete classes based on vtable). But I'm sure there are lots of missing features that I never needed but other people consider essential; let me know.
  * I use it every day and find it very helpful.
- * Not in active development right now. I fix reported bugs and add small requested features, but likely won't get around to implementing big features soon (e.g. redesigning the watch expression language to have loops etc, ARM support, Mac OS support, GUI, DAP).
+ * Not in active development right now. I fix reported bugs and add small requested features, but likely won't get around to implementing big features soon (e.g. redesigning the watch expression language to have loops etc, Mac OS support, GUI, DAP).
 
 Distributed as a single 6 MB executable file with no dependencies.
 

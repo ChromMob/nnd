@@ -95,6 +95,7 @@ Create an issue at https://github.com/al13n321/nnd/issues"###);
         HelpParagraph::CliUsage => styled_write!(text, palette.default, r###"Usage:
 nnd command [args...]   - run a program under the debugger (i.e. just prepend 'nnd' to the command line)
 sudo nnd -p pid   - attach to an existing process
+nnd --remote host:port [executable_path]   - connect to a GDB remote stub you started yourself (e.g. qemu-system-x86_64 -s -S uses 127.0.0.1:1234); pass ELF path(s) for symbols/maps
 nnd -c core_dump_path [executable_path]   - open core dump; -o flag (see below) is recommended if the core was produced on a different machine (with different version of libc than available locally)
 nnd --dump-core [--mode=direct|live|fork] -p pid > out   - instead of running the debugger, make a core dump snapshot of a running program, similar to gcore
 
@@ -153,17 +154,17 @@ Additional arguments:
 ('nnd' stands for 'no-nonsense debugger', but it doesn't quite live up to this name at the moment)
 
 Limitations:
- * Linux only
- * x86 only
+ * Linux only (host)
+ * x86-64 only for native ptrace; `--remote` GDB stubs may be x86-64, aarch64, or riscv64
  * 64-bit only
  * TUI only (no REPL, GUI, or DAP)
- * no remote debugging (but works fine over ssh)
+ * no remote *process* debugging for local ptrace targets (works fine over ssh); attach to a GDB stub with `--remote host:port`
  * single process (doesn't follow forks)
  * no record-replay or other backwards stepping
 
 Properties:
  * Not based on gdb or lldb, implemented mostly from scratch.
-   (Uses libraries for a few well-isolated things like disassembling, DWARF parsing, and demangling.)
+   (Uses libraries for a few well-isolated things like disassembling — binutils libopcodes, same as GDB — DWARF parsing, and demangling.)
  * Fast.
    Operations that can be instantaneous should be instantaneous. I.e. snappy UI, no random freezes, no long waits.
    (Known exception: if the program has >~2k threads things become pretty slow, can be improved.)
@@ -251,11 +252,12 @@ Debugging tips:
    (to start/stop all n threads we have to do n*const syscalls, then wait for n notifications - that takes a while), but there's a lot of room for improvement anyway
    (reduce the const, do the syscalls in parallel, avoid the remaining O(n^2) work on our side).
  * No customization of colors. Dark theme only.
- * No remote debugging. You can use the debugger over ssh, but it can be inconvenient for production servers: you have to scp the source code and the unstripped binary to it.
+ * No remote debugging of local ptrace targets. You can use the debugger over ssh, but it can be inconvenient for production servers: you have to scp the source code and the unstripped binary to it.
    And the debugger uses lots of RAM, which may be a problem on small servers.
    (I'm not sure what exactly to do about this. Fully separating the debugger-agent from UI+debuginfo would increase the code complexity a lot and make performance worse.
     Maybe I'll instead run the ~whole debugger on the server and have a thin client that just streams the rendered 'image' (text) from the server and sends the source code files on demand.
-    This removes the need to scp the source code to the server, but leaves all the other problems.)"###),
+    This removes the need to scp the source code to the server, but leaves all the other problems.)
+   For QEMU/VM guests you can instead start the stub yourself (`qemu-system-… -s -S`) and run `nnd --remote 127.0.0.1:1234 [vmlinux]`."###),
         HelpParagraph::Watches => styled_write!(text, palette.default, r###"In the 'watches' window, you can enter expressions to be evaluated. It uses a custom scripting language, documented here.
 
 Currently the language has no loops or conditionals, just expressions. The syntax is C-like/Rust-like.
