@@ -63,3 +63,6 @@ tikv-jemallocator = "^0.6"
 
 [dev-dependencies]
 gimli = {version = "^0.31.1", default-features = false, features = ["std", "read", "write"]}
+
+[build-dependencies]
+cc = "1"

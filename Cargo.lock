@@ -217,6 +217,7 @@ name = "nnd"
 version = "0.80.0"
 dependencies = [
  "bitflags",
+ "cc",
  "cpp_demangle",
  "crc32fast",
  "flate2",
