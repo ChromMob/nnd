@@ -1,14 +1,25 @@
 ---
 feature: qemu-gdb-remote
-status: in-progress
+status: delivered
 updated: 2026-09-24
 branch: qemu-gdb-remote
-commits:
+commits: 93731d2..1188d25
 ---
 
 # QEMU-system GDB remote + multi-arch (binutils disassembly)
 
 ## Report
+
+**What was built** — nnd can attach as a GDB remote client to a stub the user starts (`qemu-system-… -s -S`, then `nnd --remote 127.0.0.1:1234 [vmlinux]`). A full RSP codec/client (`gdbproto`/`gdb_remote`) drives memory, registers, `vCont`, and `Z0–Z4` breakpoints; `RunMode::Remote` branches resume/step/events/breakpoints/shutdown off ptrace. ELF accepts x86-64, aarch64, and riscv64; target.xml (including nested `xi:include`) feeds register layout. Disassembly uses pinned binutils 2.47 libopcodes via `build.rs` + a C shim for all three arches (Intel syntax on x86); iced-x86 is gone from the tree. Listing and step-flow call the shared `disasm::disassemble` API with per-arch mnemonic flow tables.
+
+**Verification** — `cargo build --locked` PASS. `cargo test --locked --bin nnd` — 34/34 PASS, including e2e against `qemu-system-{x86_64,aarch64,riscv64}` asserting connect → read PC → Z0 → continue → stop. One earlier parallel-run flake of the x86 e2e; isolated and subsequent full runs green. Independent re-review approved all five prior critical fixes (remote step `vCont`, data `Z2/Z4`, step Z cleanup, arch-aware analysis, `single_steps`-only step cont).
+
+**Journey log** —
+- Two parallel implementation agents were cancelled early; recovered by implementing binutils/GDB paths directly in-session.
+- System libopcodes is x86-only; multi-arch requires building pinned binutils (`third_party/build-opcodes.sh`).
+- QEMU returns `qXfer` payloads as raw XML (not hex) and nests registers in `xi:include` files — client must fetch includes and accept both encodings.
+- aarch64 virt at `-S` reports PC=0 until the first instruction; smokes step once before arming Z0.
+- Remote mode must never call ptrace resume paths; all continue/step go through `remote_send_cont` (`vCont;s` only when `single_steps`).
 
 ## [S1] Problem
 
