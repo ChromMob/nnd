@@ -139,7 +139,7 @@ impl ThreadInfo {
 }
 
 pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_added*/ bool {
-    if debugger.info.exe_inode == 0 && debugger.target_state.process_ready() {
+    if debugger.info.exe_inode == 0 && debugger.target_state.process_ready() && !debugger.mode.is_remote() {
         let path = format!("/proc/{}/exe", debugger.any_live_tid);
         let m = match fs::metadata(&path) {
             Err(e) => {
@@ -154,12 +154,13 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
         }
     }
 
-    let mut maps = if debugger.mode == RunMode::CoreDump {
+    let mut maps = if debugger.mode == RunMode::CoreDump || debugger.mode.is_remote() {
         // For core dump, we need to do refresh_maps_and_binaries_info() twice even though maps never change.
         // The first time we kick off symbols loading for all mapped binaries.
         // After ELF files for all binaries are loaded, we need to point CoreDumpMemReader to them - that's what subsequent refreshes are for.
         // Why not just parse ELF headers for all binaries synchronously in first refresh?
         // Because the plan is to support downloading binaries from debuginfod, which is not necessarily fast, so we shouldn't lock up the UI.
+        // For Remote, maps are synthesized from user-supplied ELFs at connect time and never change.
         debugger.info.maps.clone()
     } else {
         // (any_live_tid rather than pid because for a zombie main thread /proc/<pid>/maps is empty.)
@@ -194,7 +195,7 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
                 if let Some(id) = &build_id {
                     eprintln!("info: mapped binary {} has build id {}", locator.path, hexdump(id, 1000));
                 }
-                let custom_path = if debugger.mode != RunMode::CoreDump && locator.inode == debugger.info.exe_inode {
+                let custom_path = if matches!(debugger.mode, RunMode::Run | RunMode::Attach) && locator.inode == debugger.info.exe_inode {
                     // Use this special symlink instead of the regular path because it's available even after the file is deleted.
                     // Useful when recompiling the program without closing the debugger.
                     Some(format!("/proc/{}/exe", debugger.any_live_tid))
@@ -202,7 +203,7 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
                     None
                 };
                 // Guess which binary is the main executable. (If this turns out unreliable, we can switch to determining this from ELF header instead (which is less convenient because we currently parse ELF header after we use this info).)
-                let is_main_binary = !found_main_binary && if debugger.mode == RunMode::CoreDump {
+                let is_main_binary = !found_main_binary && if matches!(debugger.mode, RunMode::CoreDump | RunMode::Remote) {
                     locator.special.is_none() // take the first binary on the list, except [vdso]
                 } else {
                     locator.inode == debugger.info.exe_inode

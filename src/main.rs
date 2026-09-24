@@ -128,6 +128,7 @@ fn main() {
     let mut command_line: Option<Vec<String>> = None;
     let mut tty_file: Option<String> = None;
     let mut core_dump_path: Option<String> = None;
+    let mut remote_addr: Option<String> = None;
 
     let all_args: Vec<String> = std::env::args().collect();
     let mut args = &all_args[1..];
@@ -146,6 +147,9 @@ fn main() {
                 }
                 Ok(x) => Some(x),
             };
+        } else if let Some(v) = parse_arg(&mut args, &mut seen_args, "--remote", "-r", false, false) {
+            // Connect to an existing GDB remote stub, e.g. `qemu-system-x86_64 -s -S` then `--remote 127.0.0.1:1234`.
+            remote_addr = Some(v);
         } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--no-pty", "", true, false) {
             settings.use_tty = false;
         } else if let Some(v) = parse_arg(&mut args, &mut seen_args, "--external-tty", "-t", false, false) {
@@ -312,11 +316,18 @@ fn main() {
     }
 
     if !args.is_empty() {
-        let mut cmd = args[..].to_vec();
-        if cmd[0].starts_with("\\") {
-            cmd[0] = cmd[0][1..].to_string();
+        if remote_addr.is_some() {
+            // Positional args are ELF paths for symbols/maps in remote mode.
+            for a in args.iter() {
+                settings.supplementary_binary_paths.push(a.clone());
+            }
+        } else {
+            let mut cmd = args[..].to_vec();
+            if cmd[0].starts_with("\\") {
+                cmd[0] = cmd[0][1..].to_string();
+            }
+            command_line = Some(cmd);
         }
-        command_line = Some(cmd);
     }
 
     if let Some(v) = tty_file {
@@ -325,16 +336,16 @@ fn main() {
         if settings.stderr_file.is_none() { settings.stderr_file = Some(v.clone()); }
     }
 
-    if attach_pid.is_none() && command_line.is_none() && core_dump_path.is_none() {
-        eprintln!("usage: {} (-p pid | executable_path [args..] | [-c] core_dump_path [executable_path] | --help)", all_args[0]);
+    if attach_pid.is_none() && command_line.is_none() && core_dump_path.is_none() && remote_addr.is_none() {
+        eprintln!("usage: {} (-p pid | --remote host:port [elf...] | executable_path [args..] | [-c] core_dump_path [executable_path] | --help)", all_args[0]);
         process::exit(1);
     }
-    if (attach_pid.is_some() as usize) + (command_line.is_some() as usize) + (core_dump_path.is_some() as usize) > 1 {
-        eprintln!("must have exactly one of: --pid, --core, command line");
+    if (attach_pid.is_some() as usize) + (command_line.is_some() as usize) + (core_dump_path.is_some() as usize) + (remote_addr.is_some() as usize) > 1 {
+        eprintln!("must have exactly one of: --pid, --remote, --core, command line");
         process::exit(1);
     }
-    if command_line.is_none() && (settings.stdin_file.is_some() || settings.stdout_file.is_some() || settings.stderr_file.is_some()) {
-        eprintln!("--stdin/--stdout/--stderr/--external-tty are not allowed with --pid or --core");
+    if command_line.is_none() && remote_addr.is_none() && (settings.stdin_file.is_some() || settings.stdout_file.is_some() || settings.stderr_file.is_some()) {
+        eprintln!("--stdin/--stdout/--stderr/--external-tty are not allowed with --pid, --remote, or --core");
         process::exit(1);
     }
 
@@ -413,7 +424,7 @@ fn main() {
         }));
     }
 
-    match run(settings, attach_pid, core_dump_path, command_line, persistent, supplementary_binaries) {
+    match run(settings, attach_pid, core_dump_path, command_line, remote_addr, persistent, supplementary_binaries) {
         Ok(()) => (),
         Err(e) => {
             eprintln!("fatal: {}", e);
@@ -437,7 +448,7 @@ fn calculate_num_threads(num_threads: &Option<usize>) -> usize {
     }.max(1)
 }
 
-fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<String>, command_line: Option<Vec<String>>, persistent: PersistentState, supplementary_binaries: SupplementaryBinaries) -> Result<()> {
+fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<String>, command_line: Option<Vec<String>>, remote_addr: Option<String>, persistent: PersistentState, supplementary_binaries: SupplementaryBinaries) -> Result<()> {
     let num_threads = calculate_num_threads(&settings.num_threads);
     let context = Arc::new(Context {settings, executor: Executor::new(num_threads), wake_main_thread: Arc::new(EventFD::new())});
 
@@ -493,6 +504,12 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
         unsafe { *DEBUGGER_TO_DROP_ON_PANIC.get() = DebuggerPtr(&mut *debugger); }
     } else if let Some(path) = &core_dump_path {
         debugger = Pin::new(Box::new(Debugger::open_core_dump(path, context.clone(), persistent, supplementary_binaries)?));
+    } else if let Some(addr) = &remote_addr {
+        // ELF paths for maps: prefer first supplementary path as primary; all of them feed maps_from_elf_paths.
+        let elf_paths: Vec<String> = context.settings.supplementary_binary_paths.clone();
+        debugger = Pin::new(Box::new(Debugger::connect_remote(addr, &elf_paths, context.clone(), persistent, supplementary_binaries)?));
+        #[allow(static_mut_refs)]
+        unsafe { *DEBUGGER_TO_DROP_ON_PANIC.get() = DebuggerPtr(&mut *debugger); }
     } else {
         debugger = Pin::new(Box::new(Debugger::from_command_line(&command_line.unwrap(), context.clone(), persistent, supplementary_binaries)));
         should_start_child = true;

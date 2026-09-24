@@ -1,16 +1,18 @@
-use crate::{*, elf::*, error::*, util::*, log::*, symbols::*, process_info::*, symbols_registry::*, unwind::*, procfs::*, registers::*, disassembly::*, pool::*, settings::*, context::*, disassembly::*, expr::*, persistent::*, interp::*, os::*, term_emu::*};
+use crate::{*, elf::*, error::*, util::*, log::*, symbols::*, process_info::*, symbols_registry::*, unwind::*, procfs::*, registers::*, disassembly::*, pool::*, settings::*, context::*, disassembly::*, expr::*, persistent::*, interp::*, os::*, term_emu::*, gdb_remote::{self, GdbRemote, GdbError, StopKind}};
 use libc::{pid_t, c_char, c_void};
 use iced_x86::FlowControl;
-use std::{io, ptr, rc::Rc, collections::{HashMap, VecDeque, HashSet, hash_map::Entry}, mem, path::{Path, PathBuf}, sync::Arc, ffi::CStr, ops::Range, os::fd::AsRawFd, fs, time::{Instant, Duration}};
+use std::{io, ptr, rc::Rc, collections::{HashMap, VecDeque, HashSet, hash_map::Entry}, mem, path::{Path, PathBuf}, sync::{Arc, Mutex}, ffi::CStr, ops::Range, os::fd::AsRawFd, fs, time::{Instant, Duration}};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum RunMode {
     Run, // start the program inside the debugger
     Attach, // attach to a running process
     CoreDump,
+    Remote, // GDB remote serial protocol (e.g. qemu -s -S gdbstub); user starts the stub
 }
 impl RunMode {
-    pub fn human_string(self) -> &'static str { match self {RunMode::Run => "run", RunMode::Attach => "attach", RunMode::CoreDump => "coredump"} }
+    pub fn human_string(self) -> &'static str { match self {RunMode::Run => "run", RunMode::Attach => "attach", RunMode::CoreDump => "coredump", RunMode::Remote => "remote"} }
+    pub fn is_remote(self) -> bool { self == RunMode::Remote }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -177,6 +179,11 @@ pub struct Debugger {
     pub log: Log,
     pub prof: Profiling,
     pub persistent: PersistentState,
+
+    // GDB remote serial connection (RunMode::Remote only). Shared with MemReader::Remote.
+    pub remote: Option<Arc<Mutex<GdbRemote>>>,
+    // Parsed register layout from target.xml: (name, bit size, regnum) in g-packet order.
+    pub remote_regs: Vec<(String, u32, u64)>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
@@ -464,7 +471,7 @@ impl Debugger {
             assert!(breakpoints.iter().filter(|(_, b)| b.hidden).count() == 1);
         }
 
-        Debugger {mode, command_line, pty: None, tty_size, context, pid: 0, any_live_tid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::Invalid, waiting_for_initial_sigstop: false, initial_exec_failed: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint::default()), persistent, start_count: 0}
+        Debugger {mode, command_line, pty: None, tty_size, context, pid: 0, any_live_tid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::Invalid, waiting_for_initial_sigstop: false, initial_exec_failed: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint::default()), persistent, start_count: 0, remote: None, remote_regs: Vec::new()}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -604,6 +611,85 @@ impl Debugger {
         }
         refresh_maps_and_binaries_info(&mut r);
         Ok(r)
+    }
+
+    /// Connect to an already-running GDB remote stub (e.g. `qemu-system-x86_64 -s -S`).
+    /// `elf_paths` are user-supplied binaries for symbols; maps are synthesized from their PT_LOAD segments.
+    pub fn connect_remote(addr: &str, elf_paths: &[String], context: Arc<Context>, persistent: PersistentState, supp: SupplementaryBinaries) -> Result<Self> {
+        let mut conn = GdbRemote::connect(addr).map_err(|e| Error::new(ErrorCode::Network, format!("couldn't connect to {}: {}", addr, e)))?;
+        conn.handshake().map_err(|e| Error::new(ErrorCode::Network, format!("gdb handshake with {}: {}", addr, e)))?;
+        let mut xml = conn.fetch_target_xml().unwrap_or_default();
+        // QEMU's target.xml often only has <architecture> + xi:include; pull the included file for registers.
+        if !xml.contains("<reg ") {
+            if let Some(href) = extract_xi_include(&xml) {
+                if let Ok(extra) = conn.fetch_qxfer(&href) {
+                    xml.push('\n');
+                    xml.push_str(&extra);
+                }
+            }
+        }
+        let mut remote_regs = parse_target_xml_regs(&xml);
+        if remote_regs.is_empty() {
+            // Standard GDB i386:x86-64 `g` packet layout (i386-64bit.xml order).
+            remote_regs = default_x86_64_gdb_regs();
+        }
+        let tids = conn.threads().map_err(|e| Error::new(ErrorCode::Network, format!("gdb thread list: {}", e)))?;
+
+        let mut r = Self::new(RunMode::Remote, Vec::new(), [0, 0], context.clone(), SymbolsRegistry::new(context, supp), Pool::new(), persistent, ResourceStats::default(), Profiling::new());
+        r.remote_regs = remote_regs;
+        let conn = Arc::new(Mutex::new(conn));
+        r.remote = Some(conn.clone());
+
+        // Threads from qfThreadInfo (vCPUs under QEMU). Use the stub's tids directly as our tid keys.
+        let mut any_tid = 0i32;
+        for t in tids {
+            let tid = t as pid_t;
+            if tid <= 0 { continue; }
+            any_tid = tid;
+            let mut thread = Thread::new(r.next_thread_idx, tid, ThreadState::Suspended);
+            thread.waiting_for_initial_stop = false;
+            r.next_thread_idx += 1;
+            r.threads.insert(tid, thread);
+        }
+        if r.threads.is_empty() {
+            // Single-CPU stubs sometimes omit qfThreadInfo; synthesize tid 1.
+            let mut thread = Thread::new(r.next_thread_idx, 1, ThreadState::Suspended);
+            thread.waiting_for_initial_stop = false;
+            r.next_thread_idx += 1;
+            r.threads.insert(1, thread);
+            any_tid = 1;
+        }
+        r.any_live_tid = any_tid;
+        r.pid = any_tid; // only used as a fallback key; remote has no real pid
+        r.target_state = ProcessState::Suspended;
+
+        r.memory = MemReader::Remote(RemoteMemReader {conn, tid: any_tid});
+        r.info.maps = maps_from_elf_paths(elf_paths)?;
+        // Pretend exe_inode is nonzero so refresh_maps doesn't try /proc/pid/exe.
+        r.info.exe_inode = u64::MAX;
+
+        // Read registers for all threads while stopped.
+        let tids: Vec<pid_t> = r.threads.keys().copied().collect();
+        for tid in tids {
+            r.refresh_remote_thread(tid);
+        }
+
+        refresh_maps_and_binaries_info(&mut r);
+        Ok(r)
+    }
+
+    /// Read registers for one remote thread via `g` and store into ThreadInfo.
+    fn refresh_remote_thread(&mut self, tid: pid_t) {
+        let Some(conn) = self.remote.clone() else { return };
+        let layout = self.remote_regs.clone();
+        let mut conn = match conn.lock() { Ok(c) => c, Err(_) => return };
+        if conn.set_thread(tid as u64).is_err() { return; }
+        let Ok(raw) = conn.read_regs_raw() else { return };
+        drop(conn);
+        if let Some(t) = self.threads.get_mut(&tid) {
+            t.info.regs = registers_from_gdb(&layout, &raw);
+            t.info.extra_regs.reset_with_tid(tid);
+        }
     }
 
     pub fn start_child(&mut self, initial_step: Option<BreakpointOn>) -> Result<()> {
@@ -778,6 +864,9 @@ impl Debugger {
     pub fn process_events(&mut self) -> Result<(/*have_more_events_to_process*/ bool, /*drop_caches*/ bool)> {
         if self.mode == RunMode::CoreDump {
             return Ok((false, false));
+        }
+        if self.mode.is_remote() {
+            return self.process_events_remote();
         }
 
         // true if we should refresh process info or consider calling handle_breakpoints or something like that.
@@ -1154,16 +1243,26 @@ impl Debugger {
         self.info.drop_caches();
         if self.target_state.process_ready() {
             refresh_maps_and_binaries_info(self);
-            for t in self.threads.values_mut() {
-                t.info.invalidate(self.mode);
-                refresh_thread_info(self.pid, t, &mut self.prof.bucket, &self.context.settings);
+            if self.mode.is_remote() {
+                let tids: Vec<pid_t> = self.threads.keys().copied().collect();
+                for tid in tids {
+                    if let Some(t) = self.threads.get_mut(&tid) {
+                        t.info.invalidate(self.mode);
+                    }
+                    self.refresh_remote_thread(tid);
+                }
+            } else {
+                for t in self.threads.values_mut() {
+                    t.info.invalidate(self.mode);
+                    refresh_thread_info(self.pid, t, &mut self.prof.bucket, &self.context.settings);
+                }
             }
             self.try_pending_step_and_activate_breakpoints()?;
         } else if self.mode == RunMode::CoreDump {
             refresh_maps_and_binaries_info(self);
             for t in self.threads.values_mut() {
                 t.info.invalidate(self.mode);
-            }            
+            }
         }
 
         Ok(())
@@ -1178,6 +1277,41 @@ impl Debugger {
         eprintln!("info: resume");
 
         self.target_state = ProcessState::Running;
+
+        if self.mode.is_remote() {
+            // Activate any pending breakpoints via Z packets while still stopped.
+            if self.stopped_until_symbols_are_loaded.is_none() {
+                if let Err(e) = self.activate_breakpoints(self.breakpoints.iter().map(|t| t.0).collect()) {
+                    eprintln!("warning: failed to arm breakpoints: {}", e);
+                }
+            }
+            let conn = self.remote.clone().ok_or_else(|| error!(ProcessState, "no remote connection"))?;
+            {
+                let mut c = match conn.lock() { Ok(c) => c, Err(_) => return err!(ProcessState, "remote connection poisoned") };
+                // Prefer stepping the current thread if a step is pending.
+                let step_tid = self.stepping.as_ref().map(|s| s.tid);
+                let use_step = step_tid.is_some() && self.stepping.as_ref().map_or(false, |s| s.single_steps || s.by_instructions);
+                let r = if use_step { c.step(step_tid.map(|t| t as u64)) } else { c.cont(None) };
+                if let Err(e) = r { return Err(Error::new(ErrorCode::Network, format!("gdb remote resume: {}", e))); }
+            }
+            let should_run: Vec<pid_t> = {
+                let mut v = Vec::new();
+                for (tid, t) in &self.threads {
+                    if self.target_state_for_thread(*tid) == ThreadState::Running && t.state != ThreadState::Running {
+                        v.push(*tid);
+                    }
+                }
+                v
+            };
+            for tid in should_run {
+                if let Some(t) = self.threads.get_mut(&tid) {
+                    t.state = ThreadState::Running;
+                    t.stop_reasons.clear();
+                    t.is_after_user_debug_trap_instruction = false;
+                }
+            }
+            return Ok(());
+        }
 
         self.check_if_we_should_wait_for_symbols_to_load();
         self.resume_threads_if_needed(/*refresh_info*/ true)?;
@@ -1194,11 +1328,24 @@ impl Debugger {
 
         self.target_state = ProcessState::Suspended;
         self.stopped_until_symbols_are_loaded = None;
+        if self.mode.is_remote() {
+            let conn = self.remote.clone().ok_or_else(|| error!(ProcessState, "no remote connection"))?;
+            let stop = {
+                let mut c = match conn.lock() { Ok(c) => c, Err(_) => return err!(ProcessState, "remote connection poisoned") };
+                c.interrupt().map_err(|e| Error::new(ErrorCode::Network, format!("gdb interrupt: {}", e)))?;
+                c.wait_stop().map_err(|e| Error::new(ErrorCode::Network, format!("gdb wait_stop: {}", e)))?
+            };
+            return self.handle_remote_stop(stop);
+        }
         self.ptrace_interrupt_all_running_threads()?;
         Ok(())
     }
 
     fn ptrace_interrupt_all_running_threads(&mut self) -> Result<usize> {
+        if self.mode.is_remote() {
+            // All-stop stub: interrupt is handled in suspend(); nothing per-thread to do here.
+            return Ok(0);
+        }
         let mut n = 0;
         for (tid, t) in &mut self.threads {
             if t.state == ThreadState::Running && !t.exiting {
@@ -1217,7 +1364,7 @@ impl Debugger {
     }
 
     pub fn murder(&mut self, signal: i32) -> Result<()> {
-        if self.mode == RunMode::Attach { return err!(Usage, "not killing attached process"); }
+        if self.mode == RunMode::Attach || self.mode.is_remote() { return err!(Usage, "not killing attached process"); }
         if !self.target_state.process_ready() { return err!(Usage, "no process"); }
         eprintln!("info: kill");
         unsafe {
@@ -1843,6 +1990,10 @@ impl Debugger {
     }
 
     fn resume_threads_if_needed(&mut self, refresh_info: bool) -> Result<()> {
+        if self.mode.is_remote() {
+            // Remote resume goes through resume() → vCont; per-thread ptrace resume does not apply.
+            return Ok(());
+        }
         let tids_to_resume: Vec<pid_t> = self.threads.keys().filter(|tid| self.target_state_for_thread(**tid) == ThreadState::Running).copied().collect();
         for t in tids_to_resume {
             self.resume_thread(t, refresh_info)?;
@@ -2450,6 +2601,27 @@ impl Debugger {
         let location = &self.breakpoint_locations[idx];
         if location.active { return Ok(()); }
         let addr = location.addr;
+        if self.mode.is_remote() {
+            let kind: u8 = if location.hardware { 1 } else { 0 };
+            let size: u64 = if location.hardware { 1 } else { 1 }; // stub chooses trap encoding from kind+arch
+            let conn = self.remote.clone().ok_or_else(|| error!(ProcessState, "no remote connection"))?;
+            let mut c = match conn.lock() { Ok(c) => c, Err(_) => return err!(ProcessState, "remote connection poisoned") };
+            c.insert_breakpoint(kind, addr as u64, size).map_err(|e| Error::new(ErrorCode::Network, format!("gdb Z{}: {}", kind, e)))?;
+            drop(c);
+            if location.hardware {
+                let hw_idx = match self.hardware_breakpoints.iter().position(|b| !b.active) {
+                    None => return err!(OutOfHardwareBreakpoints, "out of hw breakpoints"),
+                    Some(i) => i };
+                let all_threads = location.breakpoints.iter().any(|b| match b { BreakpointRef::Step(_) => false, BreakpointRef::Id{..} => true });
+                let thread_specific = match &self.stepping {
+                    Some(s) if !all_threads => Some(s.tid),
+                    _ => None,
+                };
+                self.hardware_breakpoints[hw_idx] = HardwareBreakpoint {active: true, thread_specific, addr, ..Default::default()};
+            }
+            self.breakpoint_locations[idx].active = true;
+            return Ok(());
+        }
         if location.hardware {
             assert!(self.any_thread_in_state(ThreadState::Running).is_none());
             let hw_idx = match self.hardware_breakpoints.iter().position(|b| !b.active) {
@@ -2490,6 +2662,24 @@ impl Debugger {
     fn deactivate_breakpoint_location(&mut self, idx: usize, any_suspended_tid: pid_t) -> Result<()> {
         let location = &mut self.breakpoint_locations[idx];
         if !location.active { return Ok(()); }
+        if self.mode.is_remote() {
+            let kind: u8 = if location.hardware { 1 } else { 0 };
+            let addr = location.addr;
+            let conn = self.remote.clone().ok_or_else(|| error!(ProcessState, "no remote connection"))?;
+            let mut c = match conn.lock() { Ok(c) => c, Err(_) => return err!(ProcessState, "remote connection poisoned") };
+            // Stub may not have the bp (e.g. failed insert); ignore unsupported.
+            let _ = c.remove_breakpoint(kind, addr as u64, 1);
+            drop(c);
+            if location.hardware {
+                for h in &mut self.hardware_breakpoints {
+                    if h.active && h.addr == location.addr {
+                        *h = HardwareBreakpoint::default();
+                    }
+                }
+            }
+            location.active = false;
+            return Ok(());
+        }
         if location.hardware {
             for h in &mut self.hardware_breakpoints {
                 if h.active && h.addr == location.addr {
@@ -2530,6 +2720,20 @@ impl Debugger {
     // Either calls handle_breakpoints() or makes sure it'll be called as soon as all threads are suspended.
     // Caller must ensure all ThreadInfo-s are up-to-date (i.e. just don't call this from the middle of process_events()).
     fn arrange_handle_breakpoints(&mut self) -> Result<()> {
+        if self.mode.is_remote() {
+            // Use actual thread state, not target_state (resume() sets target_state before arming).
+            if self.any_thread_in_state(ThreadState::Running).is_some() {
+                self.stopping_to_handle_breakpoints = true;
+                if let Some(conn) = &self.remote {
+                    if let Ok(mut c) = conn.lock() {
+                        let _ = c.interrupt();
+                    }
+                }
+            } else {
+                self.handle_breakpoints()?;
+            }
+            return Ok(());
+        }
         if !self.stopping_to_handle_breakpoints {
             if self.ptrace_interrupt_all_running_threads()? > 0 {
                 self.stopping_to_handle_breakpoints = true;
@@ -2553,6 +2757,23 @@ impl Debugger {
             }
         }
         self.breakpoint_locations.truncate(res_idx);
+
+        if self.mode.is_remote() {
+            // Stub manages trap bytes / watchpoints; no sw↔hw conversion, no ptrace debug registers.
+            for idx in 0..self.breakpoint_locations.len() {
+                if self.breakpoint_locations[idx].no_retry {
+                    continue;
+                }
+                match self.activate_breakpoint_location(idx, self.any_live_tid) {
+                    Ok(()) => self.breakpoint_locations[idx].error = None,
+                    Err(e) => {
+                        self.breakpoint_locations[idx].error = Some(e.clone());
+                        eprintln!("breakpoint error: {}", e);
+                    }
+                }
+            }
+            return Ok(());
+        }
 
         // Convert between hardware and software breakpoints as needed:
         // if any thread is standing at a breakpoint, make it hardware, otherwise make it software.
@@ -3230,9 +3451,13 @@ impl Debugger {
         }
         let need_full_stack = does_expression_need_full_stack(expr);
 
-        let t = self.threads.get_mut(&tid).unwrap();
-        t.info.regs = ptrace_getregs(tid)?;
-        t.info.extra_regs.reset_with_tid(tid);
+        if self.mode.is_remote() {
+            self.refresh_remote_thread(tid);
+        } else {
+            let t = self.threads.get_mut(&tid).unwrap();
+            t.info.regs = ptrace_getregs(tid)?;
+            t.info.extra_regs.reset_with_tid(tid);
+        }
 
         let stack = self.get_stack_trace(tid, /*partial*/ !need_full_stack);
         let selected_subframe = if subfunction_level < SUBFUNCTION_LEVEL_MAX && !stack.frames.is_empty() {
@@ -3246,6 +3471,117 @@ impl Debugger {
         let mut eval_context = self.make_eval_context(&stack, selected_subframe, tid);
         let (val, _dubious) = eval_parsed_expression(expr, &mut eval_state, &mut eval_context)?;
         Ok(is_value_truthy(&val, &mut eval_context.memory)?)
+    }
+
+    /// Poll the remote stub for a stop when Running/Stepping; no-op when already suspended.
+    fn process_events_remote(&mut self) -> Result<(bool, bool)> {
+        match self.target_state {
+            ProcessState::Running | ProcessState::Stepping => (),
+            _ => return Ok((false, false)),
+        }
+        let conn = match &self.remote {
+            Some(c) => c.clone(),
+            None => return Ok((false, false)),
+        };
+        let stop = {
+            let mut c = match conn.lock() {
+                Ok(c) => c,
+                Err(_) => return Ok((false, false)),
+            };
+            match c.try_wait_stop(Duration::from_millis(50)) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: remote stop wait failed: {}", e);
+                    return Ok((false, false));
+                }
+            }
+        };
+        let Some(stop) = stop else { return Ok((false, false)) };
+        self.handle_remote_stop(stop)?;
+        Ok((true, false))
+    }
+
+    /// Apply a stop reply: mark all threads suspended (all-stop), refresh regs, record stop reasons.
+    fn handle_remote_stop(&mut self, stop: gdb_remote::StopInfo) -> Result<()> {
+        eprintln!("info: remote stop: {}", stop.raw);
+        self.target_state = ProcessState::Suspended;
+        self.stopped_until_symbols_are_loaded = None;
+
+        let stop_tid = stop.thread.map(|t| t as pid_t).unwrap_or(self.any_live_tid);
+        if !self.threads.contains_key(&stop_tid) {
+            // Stub reported a thread we don't know (e.g. after CPU hotplug); ignore tid mapping.
+        }
+
+        for tid in self.threads.keys().copied().collect::<Vec<_>>() {
+            if let Some(t) = self.threads.get_mut(&tid) {
+                t.state = ThreadState::Suspended;
+                t.sent_interrupt = false;
+                t.single_stepping = false;
+                t.stop_reasons.clear();
+            }
+            self.refresh_remote_thread(tid);
+        }
+
+        // Map stop kind onto nnd stop reasons for the reported thread.
+        let tid = if self.threads.contains_key(&stop_tid) { stop_tid } else { self.any_live_tid };
+        let reason = match &stop.stop_kind {
+            gdb_remote::StopKind::SwBreak | gdb_remote::StopKind::HwBreak => {
+                // Find which nnd breakpoint is at PC.
+                let pc = self
+                    .threads
+                    .get(&tid)
+                    .and_then(|t| t.info.regs.get_option(RegisterIdx::Rip))
+                    .map(|(v, _)| v as usize);
+                let mut reason = None;
+                if let Some(pc) = pc {
+                    if let Some(loc_idx) = self.find_breakpoint_location(pc) {
+                        for bref in self.breakpoint_locations[loc_idx].breakpoints.clone() {
+                            if let BreakpointRef::Id { id, subfunction_level } = bref {
+                                if let Some(bp) = self.breakpoints.try_get_mut(id) {
+                                    bp.hits += 1;
+                                }
+                                reason = Some(StopReason::Breakpoint(id));
+                                if let Some(t) = self.threads.get_mut(&tid) {
+                                    t.subframe_to_select = None;
+                                    let _ = subfunction_level;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                reason.unwrap_or(StopReason::DebugTrap)
+            }
+            gdb_remote::StopKind::Watch { .. } => StopReason::DebugTrap,
+            gdb_remote::StopKind::Signal(s) => StopReason::Signal(*s as i32),
+            gdb_remote::StopKind::Other(_) => StopReason::Signal(5),
+        };
+
+        if let Some(t) = self.threads.get_mut(&tid) {
+            t.stop_reasons.push(reason);
+            t.stop_count += 1;
+        }
+
+        // Step complete: for remote we only track instruction-level steps via vCont;s;
+        // any stop ends the step.
+        if let Some(step) = self.stepping.take() {
+            if step.tid == tid {
+                if let Some(t) = self.threads.get_mut(&tid) {
+                    if !matches!(t.stop_reasons.last(), Some(StopReason::Breakpoint(_))) {
+                        t.stop_reasons.push(StopReason::Step);
+                    }
+                }
+            } else {
+                self.stepping = Some(step);
+            }
+        }
+        self.stopping_to_handle_breakpoints = false;
+
+        // Re-arm software/hardware conversion now that we're stopped.
+        if let Err(e) = self.handle_breakpoints() {
+            eprintln!("warning: handle_breakpoints after remote stop: {}", e);
+        }
+        Ok(())
     }
 
     // Do cleanup just before exit. The Debugger is not usable after this.
@@ -3262,6 +3598,25 @@ impl Debugger {
     //  "If the tracer dies, all tracees are automatically detached and restarted, unless they were in group-stop".
     //  We do it along the way anyway because it's easy, we have to stop all threads to unset debug registers anyway.)
     pub fn shutdown(&mut self) {
+        if self.mode.is_remote() {
+            if self.target_state == ProcessState::NoProcess { return; }
+            self.target_state = ProcessState::NoProcess;
+            eprintln!("info: detaching from remote stub");
+            if let Some(conn) = self.remote.take() {
+                if let Ok(mut c) = conn.lock() {
+                    // Best-effort: clear breakpoints then detach.
+                    for location in &self.breakpoint_locations {
+                        if location.active {
+                            let kind: u8 = if location.hardware { 1 } else { 0 };
+                            let _ = c.remove_breakpoint(kind, location.addr as u64, 1);
+                        }
+                    }
+                    let _ = c.detach();
+                }
+            }
+            self.memory = MemReader::Invalid;
+            return;
+        }
         if self.mode != RunMode::Attach || self.target_state == ProcessState::NoProcess {
             return;
         }
@@ -3346,5 +3701,318 @@ impl Debugger {
 impl Drop for Debugger {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// Parse `<reg name bitsize>` entries from a GDB target description into g-packet layout.
+/// Returns (name, bit size, regnum) in packet order.
+pub fn parse_target_xml_regs(xml: &str) -> Vec<(String, u32, u64)> {
+    let mut out = Vec::new();
+    let mut next_regnum = 0u64;
+    let mut rest = xml;
+    while let Some(pos) = rest.find("<reg ") {
+        let after = &rest[pos + 5..];
+        let end = after.find('>').map(|i| i + 1).unwrap_or(after.len());
+        let tag = &after[..end];
+        rest = &after[end..];
+        let name = match tag.find("name=\"").and_then(|i| {
+            let s = &tag[i + 6..];
+            s.find('"').map(|j| s[..j].to_string())
+        }) {
+            Some(n) => n,
+            None => continue,
+        };
+        let bitsize: u32 = tag
+            .find("bitsize=\"")
+            .and_then(|i| {
+                let s = &tag[i + 9..];
+                s.find('"').and_then(|j| s[..j].parse().ok())
+            })
+            .unwrap_or(64);
+        let regnum: u64 = tag
+            .find("regnum=\"")
+            .and_then(|i| {
+                let s = &tag[i + 8..];
+                s.find('"').and_then(|j| s[..j].parse().ok())
+            })
+            .unwrap_or(next_regnum);
+        next_regnum = regnum + 1;
+        out.push((name, bitsize, regnum));
+    }
+    out.sort_by_key(|(_, _, n)| *n);
+    out
+}
+
+/// Extract first `xi:include href="..."` from a target description.
+pub fn extract_xi_include(xml: &str) -> Option<String> {
+    let pos = xml.find("xi:include")?;
+    let after = &xml[pos..];
+    let href = after.find("href=\"")?;
+    let s = &after[href + 6..];
+    let end = s.find('"')?;
+    Some(s[..end].to_string())
+}
+
+/// Standard GDB i386:x86-64 `g` packet layout when target.xml has no `<reg>` tags.
+/// Order matches binutils/gdb i386-64bit.xml (what QEMU implements).
+pub fn default_x86_64_gdb_regs() -> Vec<(String, u32, u64)> {
+    let mut v: Vec<(String, u32, u64)> = Vec::new();
+    let mut n = 0u64;
+    for name in ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                 "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+                 "rip", "eflags"] {
+        v.push((name.to_string(), 64, n));
+        n += 1;
+    }
+    for name in ["cs", "ss", "ds", "es", "fs", "gs"] {
+        v.push((name.to_string(), 16, n));
+        n += 1;
+    }
+    v.push(("fs_base".into(), 64, n)); n += 1;
+    v.push(("gs_base".into(), 64, n)); n += 1;
+    v
+}
+
+/// Decode a GDB `g` packet into nnd Registers using target.xml layout (x86-64 names).
+pub fn registers_from_gdb(layout: &[(String, u32, u64)], raw: &[u8]) -> Registers {
+    let mut r = Registers::default();
+    let mut offset = 0usize;
+    for (name, bits, _) in layout {
+        let nbytes = ((*bits as usize) + 7) / 8;
+        if offset + nbytes > raw.len() {
+            break;
+        }
+        let mut val = 0u64;
+        let take = nbytes.min(8);
+        for i in 0..take {
+            val |= (raw[offset + i] as u64) << (8 * i);
+        }
+        offset += nbytes;
+        // Map GDB names to nnd RegisterIdx (x86-64).
+        let idx = match name.as_str() {
+            "rax" => Some(RegisterIdx::Rax),
+            "rdx" => Some(RegisterIdx::Rdx),
+            "rcx" => Some(RegisterIdx::Rcx),
+            "rbx" => Some(RegisterIdx::Rbx),
+            "rsi" => Some(RegisterIdx::Rsi),
+            "rdi" => Some(RegisterIdx::Rdi),
+            "rbp" => Some(RegisterIdx::Rbp),
+            "rsp" | "sp" => Some(RegisterIdx::Rsp),
+            "r8" => Some(RegisterIdx::R8),
+            "r9" => Some(RegisterIdx::R9),
+            "r10" => Some(RegisterIdx::R10),
+            "r11" => Some(RegisterIdx::R11),
+            "r12" => Some(RegisterIdx::R12),
+            "r13" => Some(RegisterIdx::R13),
+            "r14" => Some(RegisterIdx::R14),
+            "r15" => Some(RegisterIdx::R15),
+            "rip" | "pc" => Some(RegisterIdx::Rip),
+            "cs" => Some(RegisterIdx::Cs),
+            "ss" => Some(RegisterIdx::Ss),
+            "fs" => Some(RegisterIdx::Fs),
+            "gs" => Some(RegisterIdx::Gs),
+            "fs_base" => Some(RegisterIdx::FsBase),
+            "gs_base" => Some(RegisterIdx::GsBase),
+            "eflags" | "flags" => Some(RegisterIdx::Flags),
+            "orig_rax" => Some(RegisterIdx::OrigRax),
+            _ => None,
+        };
+        if let Some(idx) = idx {
+            r.set(idx, val, false);
+        }
+    }
+    r
+}
+
+/// Build synthetic MemMapsInfo from user-supplied ELF files' PT_LOAD segments (remote mode).
+pub fn maps_from_elf_paths(paths: &[String]) -> Result<MemMapsInfo> {
+    let mut maps = MemMapsInfo::default();
+    for path in paths {
+        let file = fs::File::open(path)?;
+        let meta = file.metadata()?;
+        let elf = ElfFile::from_file(path.clone(), &file, meta.len())?;
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            meta.ino()
+        };
+        for seg in &elf.segments {
+            if seg.segment_type != PT_LOAD {
+                continue;
+            }
+            let mut perms = MemMapPermissions::empty();
+            if seg.flags & PF_R != 0 { perms.insert(MemMapPermissions::READ); }
+            if seg.flags & PF_W != 0 { perms.insert(MemMapPermissions::WRITE); }
+            if seg.flags & PF_X != 0 { perms.insert(MemMapPermissions::EXECUTE); }
+            maps.maps.push(MemMapInfo {
+                start: seg.address,
+                len: seg.size_in_memory.max(seg.size_in_file),
+                perms,
+                offset: seg.offset,
+                inode,
+                path: Some(path.clone()),
+                binary_locator: Some(BinaryLocator { path: path.clone(), inode, special: SpecialSegmentId::None }),
+                binary_id: None,
+                elf_seen: false,
+            });
+        }
+    }
+    maps.maps.sort_by_key(|m| m.start);
+    Ok(maps)
+}
+
+#[cfg(test)]
+mod remote_e2e {
+    use super::*;
+    use std::net::TcpListener;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn wait_for_port(port: u16, timeout_ms: u64) -> bool {
+        let start = Instant::now();
+        while start.elapsed().as_millis() < timeout_ms as u128 {
+            if TcpListener::bind(("127.0.0.1", port)).is_err() {
+                // Port is in use — likely qemu listening (or rare conflict; connect will tell us).
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// End-to-end against a user/test-started `qemu-system-x86_64 -S -gdb tcp:...`.
+    /// Skip cleanly if qemu-system-x86_64 is not installed.
+    #[test]
+    fn qemu_x86_64_remote_connect_bp_continue() {
+        if Command::new("qemu-system-x86_64").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| !s.success()).unwrap_or(true) {
+            eprintln!("skipping: qemu-system-x86_64 not available");
+            return;
+        }
+        let port = free_port();
+        let mut child = Command::new("qemu-system-x86_64")
+            .args(["-S", "-display", "none", "-monitor", "none", "-no-reboot"])
+            .arg("-gdb")
+            .arg(format!("tcp:127.0.0.1:{}", port))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn qemu-system-x86_64");
+        assert!(wait_for_port(port, 5000), "qemu gdbstub did not open port {}", port);
+
+        let settings = Settings::default();
+        let supp = SymbolsRegistry::open_supplementary_binaries(&settings).unwrap();
+        let context = Context::invalid();
+        let addr = format!("127.0.0.1:{}", port);
+        let mut dbg = match Debugger::connect_remote(&addr, &[], context, PersistentState::default(), supp) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = child.kill();
+                panic!("connect_remote failed: {}", e);
+            }
+        };
+
+        assert_eq!(dbg.mode, RunMode::Remote);
+        assert!(!dbg.threads.is_empty());
+        let tid = dbg.any_live_tid;
+
+        // Read PC (x86 reset vector is typically 0xfffffff0).
+        dbg.refresh_remote_thread(tid);
+        let pc = dbg.threads[&tid].info.regs.get(RegisterIdx::Rip).expect("rip present").0 as usize;
+        eprintln!("remote PC = {:#x}", pc);
+        assert_ne!(pc, 0);
+
+        // Read memory at PC.
+        let mut b = [0u8; 16];
+        dbg.memory.read(pc, &mut b).expect("read mem at PC");
+        eprintln!("mem at PC = {:02x?}", b);
+
+        // QEMU at -S reports RIP as 0xfff0 but the architectural reset vector is 0xfffffff0
+        // (real-mode CS.base + IP); software breakpoints use the linear address.
+        let bp_addr = if pc < 0x1_0000 { 0xfffffff0usize } else { pc };
+
+        // Set a software breakpoint via the normal breakpoint API.
+        let id = dbg
+            .add_breakpoint(BreakpointOn::Instruction(InstructionBreakpoint {
+                function: None,
+                addr: bp_addr,
+                subfunction_level: 0,
+            }))
+            .expect("add_breakpoint");
+        dbg.activate_breakpoints(vec![id]).expect("activate bp");
+
+        // Continue and poll for stop.
+        dbg.resume().expect("resume");
+        let mut stopped = false;
+        for _ in 0..50 {
+            let _ = dbg.process_events();
+            if dbg.target_state == ProcessState::Suspended {
+                stopped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(stopped, "expected a stop after continue with breakpoint at PC");
+        let pc2 = dbg.threads[&tid].info.regs.get(RegisterIdx::Rip).map(|(v, _)| v).unwrap_or(0) as usize;
+        eprintln!("stopped PC = {:#x}", pc2);
+
+        dbg.shutdown();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(test)]
+mod remote_debug {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use std::net::TcpListener;
+    use std::time::Instant;
+
+    #[test]
+    fn debug_regs_layout() {
+        if Command::new("qemu-system-x86_64").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| !s.success()).unwrap_or(true) {
+            eprintln!("no qemu"); return;
+        }
+        let port = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let mut child = Command::new("qemu-system-x86_64")
+            .args(["-S","-display","none","-monitor","none","-no-reboot","-gdb"])
+            .arg(format!("tcp:127.0.0.1:{}", port))
+            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let start = Instant::now();
+        while start.elapsed().as_millis() < 5000 {
+            if TcpListener::bind(("127.0.0.1", port)).is_err() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let mut conn = GdbRemote::connect(&format!("127.0.0.1:{}", port)).unwrap();
+        conn.handshake().unwrap();
+        let mut xml = conn.fetch_target_xml().unwrap_or_default();
+        eprintln!("xml1 len={} head={:.120}", xml.len(), xml);
+        if !xml.contains("<reg ") {
+            if let Some(href) = extract_xi_include(&xml) {
+                eprintln!("include={}", href);
+                match conn.fetch_qxfer(&href) {
+                    Ok(extra) => { eprintln!("xml2 len={}", extra.len()); xml.push('\n'); xml.push_str(&extra); }
+                    Err(e) => eprintln!("fetch include failed: {}", e),
+                }
+            } else {
+                eprintln!("no xi:include");
+            }
+        }
+        let layout = parse_target_xml_regs(&xml);
+        eprintln!("layout len={} first10={:?}", layout.len(), &layout[..layout.len().min(10)]);
+        let tids = conn.threads().unwrap_or_default();
+        eprintln!("tids={:?}", tids);
+        if let Some(&t) = tids.first() {
+            conn.set_thread(t).unwrap();
+            let raw = conn.read_regs_raw().unwrap();
+            eprintln!("g bytes={}", raw.len());
+            let regs = registers_from_gdb(&layout, &raw);
+            eprintln!("has rip={} val={:?}", regs.has(RegisterIdx::Rip), regs.get_option(RegisterIdx::Rip));
+            eprintln!("has rsp={} val={:?}", regs.has(RegisterIdx::Rsp), regs.get_option(RegisterIdx::Rsp));
+        }
+        let _ = child.kill(); let _ = child.wait();
     }
 }

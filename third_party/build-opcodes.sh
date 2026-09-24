@@ -57,6 +57,7 @@ make -C "$BUILD" -j"$(nproc)" all-libiberty all-opcodes all-bfd
 cp "$BUILD/opcodes/.libs/libopcodes.a" "$OUT/lib/" 2>/dev/null || cp "$BUILD/opcodes/libopcodes.a" "$OUT/lib/"
 cp "$BUILD/bfd/.libs/libbfd.a" "$OUT/lib/" 2>/dev/null || cp "$BUILD/bfd/libbfd.a" "$OUT/lib/"
 cp "$BUILD/libiberty/libiberty.a" "$OUT/lib/"
+cp "$BUILD/libsframe/.libs/libsframe.a" "$OUT/lib/" 2>/dev/null || true
 cp "$BUILD/zlib/libz.a" "$OUT/lib/" 2>/dev/null || true
 
 # Headers needed by the C shim (dis-asm.h includes bfd.h).
@@ -64,6 +65,8 @@ cp "$SRC/include/dis-asm.h" "$OUT/include/"
 cp "$BUILD/bfd/bfd.h" "$OUT/include/" 2>/dev/null || cp "$SRC/bfd/bfd.h" "$OUT/include/"
 cp "$SRC/include/ansidecl.h" "$OUT/include/" 2>/dev/null || true
 cp "$SRC/include/bfdlink.h" "$OUT/include/" 2>/dev/null || true
+cp "$SRC/include/symcat.h" "$OUT/include/" 2>/dev/null || true
+cp "$SRC/include/diagnostics.h" "$OUT/include/" 2>/dev/null || true
 for h in bucomm.h plugin-api.h; do
   cp "$SRC/include/$h" "$OUT/include/" 2>/dev/null || true
   cp "$SRC/bfd/$h" "$OUT/include/" 2>/dev/null || true

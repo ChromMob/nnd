@@ -1,6 +1,6 @@
-use crate::{*, error::*, elf::*, util::*, log::*, os::*};
+use crate::{*, error::*, elf::*, util::*, log::*, os::*, gdb_remote::GdbRemote};
 use std::io::{BufReader, BufRead};
-use std::{fs, fs::File, os::fd::{OwnedFd, AsRawFd}, str::FromStr, ops::Range, cmp::Ordering, collections::HashSet, mem::MaybeUninit, sync::Arc};
+use std::{fs, fs::File, os::fd::{OwnedFd, AsRawFd}, str::FromStr, ops::Range, cmp::Ordering, collections::HashSet, mem::MaybeUninit, sync::{Arc, Mutex}};
 use bitflags::*;
 use libc::{pid_t, c_void};
 
@@ -280,6 +280,7 @@ pub enum MemReader {
     Invalid,
     Pid(PidMemReader),
     CoreDump(Arc<CoreDumpMemReader>),
+    Remote(RemoteMemReader),
 }
 impl MemReader {
     pub fn check_valid(&self) -> Result<()> { match &self {Self::Invalid => err!(ProcessState, "no process"), _ => Ok(())} }
@@ -289,6 +290,7 @@ impl MemReader {
             Self::Invalid => return err!(ProcessState, "no process"),
             Self::Pid(r) => return r.read_uninit(offset, buf),
             Self::CoreDump(r) => return r.read_uninit(offset, buf),
+            Self::Remote(r) => return r.read_uninit(offset, buf),
         }
     }
 
@@ -334,6 +336,34 @@ impl PidMemReader {
                 return err!(ProcessState, "unexpected EOF in mem @{:x}:0x{:x}", addr, buf.len());
             }
             Ok(std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len()))
+        }
+    }
+}
+
+/// Reads debuggee memory over GDB remote protocol (`m` packets).
+/// Thread id is used for `Hg` so QEMU translates through the right vCPU page tables.
+#[derive(Clone)]
+pub struct RemoteMemReader {
+    pub conn: Arc<Mutex<GdbRemote>>,
+    pub tid: pid_t,
+}
+impl RemoteMemReader {
+    pub fn read_uninit<'a>(&self, addr: usize, buf: &'a mut [MaybeUninit<u8>]) -> Result<&'a mut [u8]> {
+        let mut conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(_) => return err!(ProcessState, "remote connection poisoned"),
+        };
+        if self.tid != 0 {
+            conn.set_thread(self.tid as u64).map_err(|e| Error::new(ErrorCode::ProcessState, format!("gdb remote: {}", e)))?;
+        }
+        let data = conn.read_mem(addr as u64, buf.len()).map_err(|e| Error::new(ErrorCode::ProcessState, format!("gdb remote: {}", e)))?;
+        if data.len() != buf.len() {
+            return err!(ProcessState, "unexpected EOF in mem @{:x}:0x{:x}", addr, buf.len());
+        }
+        unsafe {
+            let out = std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len());
+            out.copy_from_slice(&data);
+            Ok(out)
         }
     }
 }

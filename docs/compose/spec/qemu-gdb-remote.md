@@ -16,7 +16,7 @@ nnd can only debug native Linux x86-64 processes via ptrace (README: "Linux only
 
 ## [S2] Design
 
-**Target model — `RunMode::QemuRemote`.** New CLI form `nnd --qemu <host:port> <elf> [more elfs]` connects to an existing QEMU gdbstub (`qemu-system-<arch> … -S -gdb tcp::…`). No pid, no spawn, no `/proc` maps, no pty, no fork/exec/signal events. Threads are vCPUs (`qfThreadInfo`); symbols come from the user-supplied ELF(s) laid over their `PT_LOAD` vaddrs (synthetic `MemMapsInfo`); debuggee console is QEMU's, not nnd's.
+**Target model — `RunMode::Remote`.** New CLI form `nnd --remote <host:port> <elf> [more elfs]` connects as a GDB client to an **already-running** stub the user started (e.g. `qemu-system-<arch> … -s -S`, where `-s` is `-gdb tcp::1234`). nnd never spawns or manages QEMU. No pid, no `/proc` maps, no pty, no fork/exec/signal events. Threads are whatever `qfThreadInfo` reports (vCPUs under QEMU); symbols come from the user-supplied ELF(s) laid over their `PT_LOAD` vaddrs (synthetic `MemMapsInfo`); debuggee console is the stub's, not nnd's.
 
 **Transport — GDB remote serial protocol** (`src/gdbproto.rs` codec, `src/gdb_remote.rs` client):
 
@@ -40,12 +40,12 @@ nnd can only debug native Linux x86-64 processes via ptrace (README: "Linux only
 
 **Breakpoints.** `Z0` (sw, kind = insn size), `Z1` (hw bp), `Z2`/`Z3`/`Z4` (write/read/access watch) — maps onto nnd's existing software/hardware/data breakpoint model; QEMU inserts/removes the trap bytes itself.
 
-**CLI/docs.** `--qemu <addr>`; extra ELF paths reuse the supplementary-binaries machinery. `doc.rs`/README document the mode and its limits.
+**CLI/docs.** `--remote <addr>` (required host:port; docs show `127.0.0.1:1234` for `qemu -s`); extra ELF paths reuse the supplementary-binaries machinery. `doc.rs`/README document the mode and its limits.
 
 ### Testing boundaries
 
 - Unit: packet codec (framing, checksum, escape, reassembly); binutils shim (known byte sequences per arch, length, targets, mnemonic flow); target.xml parser; ELF synthetic maps; flow tables.
-- Integration (`tests/`, skipped cleanly when qemu is absent): against `qemu-system-{x86_64,aarch64,riscv64} -S -gdb tcp:… -display none` — connect, read PC/memory at reset, set/clear `Z0`, `vCont` stop-reply; plus one `Debugger`-level smoke (connect → read regs → breakpoint → continue → hit) on the first arch with a bootable payload.
+- Integration (skipped cleanly when qemu is absent): against `qemu-system-{x86_64,aarch64,riscv64} -s -S -display none` started by the test — connect, read PC/memory at reset, set/clear `Z0`, `vCont` stop-reply; plus one `Debugger`-level smoke (connect → read regs → breakpoint → continue → hit) on the first arch with a bootable payload.
 - Baseline: `cargo build --locked` on the worktree before changes must stay green (`PRE-EXISTING` any failures discovered later).
 
 ## [S3] Out of Scope
@@ -56,14 +56,14 @@ nnd can only debug native Linux x86-64 processes via ptrace (README: "Linux only
 - Guest-Linux process discovery, ASLR slide inference, kernel ORC unwinding, guest signal/syscall event streams.
 - Non-stop RSP mode, multiprocess `ppid.tid` extension beyond what QEMU needs, reverse execution, record/replay.
 - Phase-3 polish beyond what falls out naturally: memory-read coalescing cache, reconnect UX, deep SMP stop-reason per-vCPU UI.
-- DAP/GUI; spawning QEMU from nnd (user launches QEMU).
+- DAP/GUI; spawning or managing QEMU (or any stub) from nnd — the user launches it (`qemu … -s -S`) and nnd only connects.
 
 ## Tasks
 
-- [ ] T1: Multi-arch libopcodes build (pinned binutils, static link via build.rs) — acceptance: `cargo build --locked` succeeds with libopcodes linked; shim disassembles fixed x86-64, aarch64, and riscv64 byte sequences to expected text/length in unit tests (covers: S2 Disassembly)
-- [ ] T2: Disasm Rust API + flow/mnemonic tables (3 arches, Intel x86) — acceptance: public API returns text, length, targets, flow kind; unit tests cover call/branch/ret/syscall classification per arch (covers: S2 Disassembly; depends: T1)
-- [ ] T3: `gdbproto` codec + `gdb_remote` client — acceptance: codec unit tests (frame/cksum/escape/no-ack/partial reads); client implements qSupported, target.xml fetch, threads, mem, regs, vCont, Z packets, stop-reply parse — unit-tested against an in-process mock stub (covers: S2 Transport)
-- [ ] T4: Debugger `QemuRemote` backend + CLI `--qemu` + synthetic maps — acceptance: `nnd --qemu` connects; integration test against `qemu-system-x86_64 -S -gdb` performs connect → read PC/memory → set breakpoint → continue → observes stop; ptrace path unchanged (`cargo build --locked` + existing tests green) (covers: S2 Target model, Debugger integration, Breakpoints, CLI; depends: T3)
+- [x] T1: Multi-arch libopcodes build (pinned binutils, static link via build.rs) — acceptance: `cargo build --locked` succeeds with libopcodes linked; shim disassembles fixed x86-64, aarch64, and riscv64 byte sequences to expected text/length in unit tests (covers: S2 Disassembly)
+- [x] T2: Disasm Rust API + flow/mnemonic tables (3 arches, Intel x86) — acceptance: public API returns text, length, targets, flow kind; unit tests cover call/branch/ret/syscall classification per arch (covers: S2 Disassembly; depends: T1)
+- [x] T3: `gdbproto` codec + `gdb_remote` client — acceptance: codec unit tests (frame/cksum/escape/no-ack/partial reads); client implements qSupported, target.xml fetch, threads, mem, regs, vCont, Z packets, stop-reply parse — unit-tested against an in-process mock stub (covers: S2 Transport)
+- [ ] T4: Debugger `Remote` backend + CLI `--remote` + synthetic maps — acceptance: `nnd --remote 127.0.0.1:PORT` connects to a user/test-started stub; integration test starts `qemu-system-x86_64 -s -S`, connects, read PC/memory → set breakpoint → continue → observes stop; ptrace path unchanged (`cargo build --locked` + existing tests green) (covers: S2 Target model, Debugger integration, Breakpoints, CLI; depends: T3)
 - [ ] T5: Multi-arch registers/ELF/unwind (target.xml parse, e_machine 183/243, DWARF maps) — acceptance: target.xml fixture tests for x86-64/aarch64/riscv64; `elf.rs` accepts the three machines and still rejects others; register names/aliases resolve; integration smoke on `qemu-system-aarch64` and `qemu-system-riscv64` (connect, read PC, Z0+stop) (covers: S2 Registers, ELF gate; depends: T4, T2)
 - [ ] T6: Move listing + step-flow off iced-x86 onto binutils backend — acceptance: `disassembly.rs`/`debugger.rs` step analysis use the new API; `iced-x86` removed from `Cargo.toml`; unit + integration tests pass (covers: S2 Disassembly; depends: T2, T4)
-- [ ] T7: Docs (`doc.rs` help, README limitations) — acceptance: `--qemu` appears in CLI help; README limitations updated to describe remote/QEMU mode honestly (covers: S2 CLI/docs; depends: T4)
+- [ ] T7: Docs (`doc.rs` help, README limitations) — acceptance: `--remote` appears in CLI help; README limitations updated to describe remote mode honestly (covers: S2 CLI/docs; depends: T4)

@@ -398,7 +398,7 @@ impl DebuggerUI {
             RunMode::CoreDump => "quit",
             _ if debugger.target_state == ProcessState::NoProcess => "quit",
             RunMode::Run => "kill and quit",
-            RunMode::Attach => "detach and quit",
+            RunMode::Attach | RunMode::Remote => "detach and quit",
         }));
         hints.push(KeyHint::key(KeyAction::Help, "help"));
         hints.push(KeyHint::key(KeyAction::Cancel, "close dialog (like this one) or search bar").conditional(false, "if any"));

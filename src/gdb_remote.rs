@@ -84,6 +84,23 @@ fn parse_u64_hex(s: &str) -> Result<u64> {
     u64::from_str_radix(s, 16).map_err(|_| GdbError::Protocol(format!("bad hex number: {}", s)))
 }
 
+/// qXfer body: either hex-encoded (classic GDB) or raw (QEMU returns raw XML).
+fn decode_qxfer_chunk(body: &[u8]) -> Vec<u8> {
+    if body.is_empty() {
+        return Vec::new();
+    }
+    // Raw text/XML (QEMU): starts with '<' or whitespace+'<'
+    if body[0] == b'<' || body[0] == b' ' || body[0] == b'\n' || body[0] == b'?' {
+        return body.to_vec();
+    }
+    if body.len() % 2 == 0 && body.iter().all(|c| c.is_ascii_hexdigit()) {
+        if let Ok(v) = hex_decode(std::str::from_utf8(body).unwrap_or("")) {
+            return v;
+        }
+    }
+    body.to_vec()
+}
+
 pub struct GdbRemote {
     stream: TcpStream,
     decoder: Decoder,
@@ -196,28 +213,34 @@ impl GdbRemote {
     }
 
     /// Fetch target description XML (`target.xml`), concatenating qXfer chunks.
+    /// QEMU returns the payload as raw bytes after `l`/`m` (not hex); GDB stubs often hex-encode.
+    /// Accept both.
     pub fn fetch_target_xml(&mut self) -> Result<String> {
+        self.fetch_qxfer("target.xml")
+    }
+
+    /// Fetch an arbitrary feature file via qXfer:features:read.
+    pub fn fetch_qxfer(&mut self, annex: &str) -> Result<String> {
         let mut out = Vec::new();
         let mut offset = 0usize;
         loop {
             let len = (self.packet_size.saturating_sub(64)).min(0xfffe);
-            let req = format!("qXfer:features:read:target.xml:{:x},{:x}", offset, len);
+            let req = format!("qXfer:features:read:{}:{:x},{:x}", annex, offset, len);
             let reply = self.send_packet(req.as_bytes())?;
             if reply.is_empty() {
                 return Err(GdbError::Protocol("empty qXfer reply".into()));
             }
-            match reply[0] {
-                b'l' => {
-                    let body = hex_decode(std::str::from_utf8(&reply[1..]).map_err(|_| GdbError::Protocol("qXfer not utf8".into()))?)?;
-                    out.extend_from_slice(&body);
-                    return Ok(String::from_utf8_lossy(&out).into_owned());
-                }
-                b'm' => {
-                    let body = hex_decode(std::str::from_utf8(&reply[1..]).map_err(|_| GdbError::Protocol("qXfer not utf8".into()))?)?;
-                    offset += body.len();
-                    out.extend_from_slice(&body);
-                }
+            let (more, body) = match reply[0] {
+                b'l' => (false, &reply[1..]),
+                b'm' => (true, &reply[1..]),
                 other => return Err(GdbError::Protocol(format!("unexpected qXfer lead byte {}", other as char))),
+            };
+            // Hex if even length and all hex digits and looks encoded (XML starts with '<' = 0x3c when raw).
+            let chunk = decode_qxfer_chunk(body);
+            offset += chunk.len();
+            out.extend_from_slice(&chunk);
+            if !more {
+                return Ok(String::from_utf8_lossy(&out).into_owned());
             }
         }
     }
