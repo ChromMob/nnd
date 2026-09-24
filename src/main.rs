@@ -680,3 +680,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
         }
     }
 }
+
+pub mod gdbproto;
+pub mod gdb_remote;
+pub mod disasm;
