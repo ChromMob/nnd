@@ -1288,38 +1288,16 @@ impl Debugger {
         self.target_state = ProcessState::Running;
 
         if self.mode.is_remote() {
-            // Activate any pending breakpoints via Z packets while still stopped.
+            // Arm breakpoints (code + data) via Z packets while still stopped, then one vCont.
             if self.stopped_until_symbols_are_loaded.is_none() {
                 if let Err(e) = self.activate_breakpoints(self.breakpoints.iter().map(|t| t.0).collect()) {
                     eprintln!("warning: failed to arm breakpoints: {}", e);
                 }
-            }
-            let conn = self.remote.clone().ok_or_else(|| error!(ProcessState, "no remote connection"))?;
-            {
-                let mut c = match conn.lock() { Ok(c) => c, Err(_) => return err!(ProcessState, "remote connection poisoned") };
-                // Prefer stepping the current thread if a step is pending.
-                let step_tid = self.stepping.as_ref().map(|s| s.tid);
-                let use_step = step_tid.is_some() && self.stepping.as_ref().map_or(false, |s| s.single_steps || s.by_instructions);
-                let r = if use_step { c.step(step_tid.map(|t| t as u64)) } else { c.cont(None) };
-                if let Err(e) = r { return Err(Error::new(ErrorCode::Network, format!("gdb remote resume: {}", e))); }
-            }
-            let should_run: Vec<pid_t> = {
-                let mut v = Vec::new();
-                for (tid, t) in &self.threads {
-                    if self.target_state_for_thread(*tid) == ThreadState::Running && t.state != ThreadState::Running {
-                        v.push(*tid);
-                    }
-                }
-                v
-            };
-            for tid in should_run {
-                if let Some(t) = self.threads.get_mut(&tid) {
-                    t.state = ThreadState::Running;
-                    t.stop_reasons.clear();
-                    t.is_after_user_debug_trap_instruction = false;
+                if let Err(e) = self.arrange_handle_breakpoints() {
+                    eprintln!("warning: handle_breakpoints before resume: {}", e);
                 }
             }
-            return Ok(());
+            return self.remote_send_cont();
         }
 
         self.check_if_we_should_wait_for_symbols_to_load();
@@ -1793,8 +1771,9 @@ impl Debugger {
         }
 
         let mut may_do_syscalls = false;
+        let step_arch = self.arch_for_step(self.stepping.as_ref().and_then(|s| Some(s.binary_id)));
         for range in &step.addr_ranges {
-            self.determine_some_step_breakpoint_locations(&breakpoint_types, range.clone(), &step.addr_ranges, /*skip_first_instruction*/ false, &mut breakpoints_to_add, &mut may_do_syscalls, &mut buf)?;
+            self.determine_some_step_breakpoint_locations_arch(&breakpoint_types, range.clone(), &step.addr_ranges, /*skip_first_instruction*/ false, &mut breakpoints_to_add, &mut may_do_syscalls, &mut buf, step_arch)?;
         }
         step.keep_other_threads_suspended &= !may_do_syscalls;
 
@@ -1897,7 +1876,10 @@ impl Debugger {
         }
 
         if self.stepping.as_ref().unwrap().keep_other_threads_suspended {
-            if self.target_state_for_thread(tid) == ThreadState::Running {
+            if self.mode.is_remote() {
+                // Instruction/range step on this thread; others stay stopped (all-stop stub).
+                self.remote_send_cont()?;
+            } else if self.target_state_for_thread(tid) == ThreadState::Running {
                 self.resume_thread(tid, true)?;
             }
         } else {
@@ -1910,7 +1892,11 @@ impl Debugger {
     // Decode instructions in given address ranges and find things like calls, jump, and syscalls. Based on that, make a list of addresses for internal breakpoints needed for a step.
     // Annoyingly, this sometimes needs to be re-done in the middle of a step (see comment at one of the call sites), so it's extracted into a function.
     // Only some StepBreakpointType-s are handled here, others only need to be handled when starting a step.
-    fn determine_some_step_breakpoint_locations(&self, breakpoint_types: &[StepBreakpointType], addr_range: Range<usize>, all_addr_ranges: &[Range<usize>], mut skip_first_instruction: bool, breakpoints_to_add: &mut Vec<(StepBreakpointType, /*addr*/ usize)>, out_may_do_syscalls: &mut bool, buf: &mut Vec<u8>) -> Result<()> {
+    fn determine_some_step_breakpoint_locations(&self, breakpoint_types: &[StepBreakpointType], addr_range: Range<usize>, all_addr_ranges: &[Range<usize>], skip_first_instruction: bool, breakpoints_to_add: &mut Vec<(StepBreakpointType, /*addr*/ usize)>, out_may_do_syscalls: &mut bool, buf: &mut Vec<u8>) -> Result<()> {
+        return self.determine_some_step_breakpoint_locations_arch(breakpoint_types, addr_range, all_addr_ranges, skip_first_instruction, breakpoints_to_add, out_may_do_syscalls, buf, crate::disasm::Arch::X86_64);
+    }
+
+    fn determine_some_step_breakpoint_locations_arch(&self, breakpoint_types: &[StepBreakpointType], addr_range: Range<usize>, all_addr_ranges: &[Range<usize>], mut skip_first_instruction: bool, breakpoints_to_add: &mut Vec<(StepBreakpointType, /*addr*/ usize)>, out_may_do_syscalls: &mut bool, buf: &mut Vec<u8>, arch: crate::disasm::Arch) -> Result<()> {
         if breakpoint_types.contains(&StepBreakpointType::AfterRange) {
             breakpoints_to_add.push((StepBreakpointType::AfterRange, addr_range.end));
         }
@@ -1918,7 +1904,6 @@ impl Debugger {
         let bp_on_jump_out = breakpoint_types.contains(&StepBreakpointType::JumpOut);
         if bp_on_call || bp_on_jump_out {
             self.load_code_for_decode(addr_range.clone(), buf)?;
-            let arch = crate::disasm::Arch::X86_64; // step ranges come from the debuggee; native default
             let mut off = 0usize;
             while off < buf.len() {
                 let ip = addr_range.start + off;
@@ -2020,12 +2005,51 @@ impl Debugger {
 
     fn resume_threads_if_needed(&mut self, refresh_info: bool) -> Result<()> {
         if self.mode.is_remote() {
-            // Remote resume goes through resume() → vCont; per-thread ptrace resume does not apply.
-            return Ok(());
+            // One vCont for the whole all-stop VM. Called from resume(), step(), and try_pending_step.
+            return self.remote_send_cont();
         }
         let tids_to_resume: Vec<pid_t> = self.threads.keys().filter(|tid| self.target_state_for_thread(**tid) == ThreadState::Running).copied().collect();
         for t in tids_to_resume {
             self.resume_thread(t, refresh_info)?;
+        }
+        Ok(())
+    }
+
+    /// Send vCont (s if single-stepping, else c) and mark threads Running.
+    fn remote_send_cont(&mut self) -> Result<()> {
+        if !matches!(self.target_state, ProcessState::Running | ProcessState::Stepping) {
+            return Ok(());
+        }
+        let conn = self.remote.clone().ok_or_else(|| error!(ProcessState, "no remote connection"))?;
+        {
+            let mut c = match conn.lock() { Ok(c) => c, Err(_) => return err!(ProcessState, "remote connection poisoned") };
+            let single = self.stepping.as_ref().map_or(false, |s| s.single_steps);
+            let step_tid = self.stepping.as_ref().map(|s| s.tid);
+            // vCont;s only for true instruction steps; range steps use Z breakpoints + vCont;c.
+            let r = if single {
+                c.step(step_tid.map(|t| t as u64))
+            } else {
+                c.cont(None)
+            };
+            if let Err(e) = r {
+                return Err(Error::new(ErrorCode::Network, format!("gdb remote resume: {}", e)));
+            }
+        }
+        let should_run: Vec<pid_t> = {
+            let mut v = Vec::new();
+            for (tid, t) in &self.threads {
+                if self.target_state_for_thread(*tid) == ThreadState::Running && t.state != ThreadState::Running {
+                    v.push(*tid);
+                }
+            }
+            v
+        };
+        for tid in should_run {
+            if let Some(t) = self.threads.get_mut(&tid) {
+                t.state = ThreadState::Running;
+                t.stop_reasons.clear();
+                t.is_after_user_debug_trap_instruction = false;
+            }
         }
         Ok(())
     }
@@ -2457,6 +2481,14 @@ impl Debugger {
         }
         for h in &mut self.hardware_breakpoints {
             if h.active && h.data_breakpoint_id == Some(id) {
+                if self.mode.is_remote() && h.pushed_to_threads {
+                    if let Some(conn) = &self.remote {
+                        if let Ok(mut c) = conn.lock() {
+                            let kind: u8 = if h.stop_on_read { 4 } else { 2 };
+                            let _ = c.remove_breakpoint(kind, h.addr as u64, h.data_size as u64);
+                        }
+                    }
+                }
                 *h = HardwareBreakpoint::default();
             }
         }
@@ -2801,6 +2833,44 @@ impl Debugger {
                     }
                 }
             }
+            // Data breakpoints live in hardware_breakpoints[] and become Z2/Z3/Z4 on the stub.
+            if let Some(conn) = self.remote.clone() {
+                let mut c = match conn.lock() { Ok(c) => c, Err(_) => return Ok(()) };
+                for h in &mut self.hardware_breakpoints {
+                    if !h.active || h.data_breakpoint_id.is_none() {
+                        continue;
+                    }
+                    let kind: u8 = if h.stop_on_read { 4 /* access: nnd always stops on write too */ } else { 2 /* write */ };
+                    let addr = h.addr as u64;
+                    let size = h.data_size as u64;
+                    if !h.pushed_to_threads {
+                        match c.insert_breakpoint(kind, addr, size) {
+                            Ok(()) => { h.pushed_to_threads = true; }
+                            Err(e) => {
+                                eprintln!("breakpoint error: watch Z{} @0x{:x}: {}", kind, addr, e);
+                                if let Some(id) = h.data_breakpoint_id {
+                                    if let Some(b) = self.breakpoints.try_get_mut(id) {
+                                        b.enabled = false;
+                                        b.addrs = err!(OutOfHardwareBreakpoints, "stub rejected watchpoint");
+                                    }
+                                }
+                                *h = HardwareBreakpoint::default();
+                            }
+                        }
+                    }
+                }
+                // Drop watch slots that were deactivated (deactivate_breakpoint clears them).
+                for i in 0..self.hardware_breakpoints.len() {
+                    if !self.hardware_breakpoints[i].active && self.hardware_breakpoints[i].pushed_to_threads {
+                        let h = &mut self.hardware_breakpoints[i];
+                        let addr = h.addr as u64;
+                        let kind: u8 = if h.stop_on_read { 4 } else { 2 };
+                        let size = h.data_size as u64;
+                        let _ = c.remove_breakpoint(kind, addr, size);
+                        h.pushed_to_threads = false;
+                    }
+                }
+            }
             return Ok(());
         }
 
@@ -3106,7 +3176,7 @@ impl Debugger {
         let mut breakpoints_to_add: Vec<(StepBreakpointType, usize)> = Vec::new();
         let mut may_do_syscalls = false;
         // (It may be possible for the new range to intersect some existing ranges. This shouldn't break anything.)
-        match self.determine_some_step_breakpoint_locations(&breakpoint_types, new_range.clone(), &addr_ranges, skip_first_instruction, &mut breakpoints_to_add, &mut may_do_syscalls, &mut Vec::new()) {
+        match self.determine_some_step_breakpoint_locations_arch(&breakpoint_types, new_range.clone(), &addr_ranges, skip_first_instruction, &mut breakpoints_to_add, &mut may_do_syscalls, &mut Vec::new(), binary.arch()) {
             Err(_) => return true,
             Ok(()) => (),
         }
@@ -3125,12 +3195,18 @@ impl Debugger {
             // When starting the step, it seemed that it can'd hit syscalls, so we can keep other threads stopped as an optimization.
             // But now it turned out that the step may hit syscall (when running through non-statement instructions), so we have
             // to start other threads to avoid getting stuck if the syscall e.g. waits for a lock held by another thread.
+            if self.mode.is_remote() {
+                if let Err(e) = self.remote_send_cont() {
+                    eprintln!("warning: remote cont after step update: {}", e);
+                }
+            } else {
             let tids_to_resume: Vec<pid_t> = self.threads.keys().filter(|tid| **tid != step_tid && self.target_state_for_thread(**tid) == ThreadState::Running).copied().collect();
             for t in tids_to_resume {
                 match self.resume_thread(t, /*refresh_info*/ true) {
                     Err(_) => return true,
                     Ok(()) => (),
                 }
+            }
             }
         }
 
@@ -3591,17 +3667,14 @@ impl Debugger {
             t.stop_count += 1;
         }
 
-        // Step complete: for remote we only track instruction-level steps via vCont;s;
-        // any stop ends the step.
-        if let Some(step) = self.stepping.take() {
-            if step.tid == tid {
-                if let Some(t) = self.threads.get_mut(&tid) {
-                    if !matches!(t.stop_reasons.last(), Some(StopReason::Breakpoint(_))) {
-                        t.stop_reasons.push(StopReason::Step);
-                    }
+        // Step complete: strip internal Step breakpoints (cancel_stepping) so Z packets don't linger.
+        let step_tid_done = self.stepping.as_ref().map(|s| s.tid);
+        if step_tid_done == Some(tid) {
+            self.cancel_stepping();
+            if let Some(t) = self.threads.get_mut(&tid) {
+                if !matches!(t.stop_reasons.last(), Some(StopReason::Breakpoint(_))) {
+                    t.stop_reasons.push(StopReason::Step);
                 }
-            } else {
-                self.stepping = Some(step);
             }
         }
         self.stopping_to_handle_breakpoints = false;
@@ -3812,6 +3885,7 @@ pub fn default_x86_64_gdb_regs() -> Vec<(String, u32, u64)> {
         v.push((name.to_string(), 16, n));
         n += 1;
     }
+    v.push(("orig_rax".into(), 64, n)); n += 1;
     v.push(("fs_base".into(), 64, n)); n += 1;
     v.push(("gs_base".into(), 64, n));
     v
@@ -3860,8 +3934,24 @@ pub fn registers_from_gdb(layout: &[(String, u32, u64)], raw: &[u8]) -> Register
             "gs_base" => Some(RegisterIdx::GsBase),
             "eflags" | "flags" | "cpsr" | "sstatus" => Some(RegisterIdx::Flags),
             "orig_rax" => Some(RegisterIdx::OrigRax),
-            // aarch64 x29/x30 ≈ FP/LR; store in Rbp/Rip-adjacent slots used by UI.
-            "x29" => Some(RegisterIdx::Rbp),
+            // aarch64 / riscv GPRs mapped onto the fat x86-shaped slots for stack traces.
+            // Names in the register window still follow REGISTER_NAMES (x86); values are usable for unwind.
+            "x0" | "a0" => Some(RegisterIdx::Rax),
+            "x1" | "ra" | "lr" => Some(RegisterIdx::Ret), // link register
+            "x2" | "a1" => Some(RegisterIdx::Rdx),
+            "x3" | "a2" => Some(RegisterIdx::Rcx),
+            "x4" | "a3" => Some(RegisterIdx::Rbx),
+            "x5" | "a4" => Some(RegisterIdx::Rsi),
+            "x6" | "a5" => Some(RegisterIdx::Rdi),
+            "x7" | "a6" => Some(RegisterIdx::R8),
+            "x8" | "a7" | "fp" | "s0" | "x29" => Some(RegisterIdx::Rbp), // FP
+            "x9" => Some(RegisterIdx::R9),
+            "x10" => Some(RegisterIdx::R10),
+            "x11" => Some(RegisterIdx::R11),
+            "x12" => Some(RegisterIdx::R12),
+            "x13" => Some(RegisterIdx::R13),
+            "x14" => Some(RegisterIdx::R14),
+            "x15" => Some(RegisterIdx::R15),
             "x30" => Some(RegisterIdx::Ret),
             _ => None,
         };
@@ -4114,18 +4204,30 @@ mod remote_multiarch {
         let tid = dbg.any_live_tid;
         dbg.refresh_remote_thread(tid);
         let pc_slot = dbg.threads[&tid].info.regs.has(RegisterIdx::Rip);
-        let pc = dbg.threads[&tid].info.regs.get_option(RegisterIdx::Rip).map(|(v, _)| v).unwrap_or(0);
+        let mut pc = dbg.threads[&tid].info.regs.get_option(RegisterIdx::Rip).map(|(v, _)| v).unwrap_or(0);
         eprintln!("{} PC = {:#x} (decoded={})", emu, pc, pc_slot);
-        // aarch64 virt at -S reports PC=0 until the first instruction; only require the slot decoded.
+        // aarch64 virt at -S reports PC=0 until the first instruction; step once so PC is meaningful.
         assert!(pc_slot, "{}: PC register not decoded from target.xml", emu);
+        if pc == 0 {
+            let stop = {
+                let conn = dbg.remote.as_ref().expect("remote conn").clone();
+                let mut c = conn.lock().unwrap();
+                c.step(Some(tid as u64)).expect("vCont;s");
+                c.wait_stop().expect("wait step stop")
+            };
+            dbg.handle_remote_stop(stop).expect("handle step stop");
+            dbg.refresh_remote_thread(tid);
+            pc = dbg.threads[&tid].info.regs.get_option(RegisterIdx::Rip).map(|(v, _)| v).unwrap_or(0);
+            eprintln!("{} PC after step = {:#x}", emu, pc);
+        }
+        assert_ne!(pc, 0, "{}: PC still zero after step", emu);
 
         let mut b = [0u8; 8];
-        let mem_ok = dbg.memory.read((if pc == 0 { 0x4000_0000 } else { pc }) as usize, &mut b).is_ok();
+        let mem_ok = dbg.memory.read(pc as usize, &mut b).is_ok();
         eprintln!("{} mem read ok={}", emu, mem_ok);
 
-        // Z0 at PC, continue, expect stop (or at least a clean resume path).
-        // Breakpoint at a plausible code address for this machine (reset vector-ish).
-        let bp_addr = if pc != 0 { pc as usize } else if emu.contains("aarch64") { 0x4000_0000 } else { 0x1000 };
+        // Z0 at PC, continue, expect stop.
+        let bp_addr = pc as usize;
         let id = dbg.add_breakpoint(BreakpointOn::Instruction(InstructionBreakpoint {
             function: None,
             addr: bp_addr,
@@ -4143,7 +4245,8 @@ mod remote_multiarch {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         eprintln!("{} stopped={}", emu, stopped);
-        // Not asserting stopped for non-x86: reset vector/ROM quirks; x86 e2e covers the hit path.
+        // Acceptance: Z0 + continue observes a stop.
+        assert!(stopped, "{}: expected stop after continue with breakpoint", emu);
         dbg.shutdown();
         let _ = child.kill();
         let _ = child.wait();

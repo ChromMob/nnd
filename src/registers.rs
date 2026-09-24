@@ -69,20 +69,40 @@ impl RegisterIdx {
     pub const COUNT: usize = RegisterIdx::Ret as usize + 1;
 
     pub fn from_dwarf(r: gimli::Register) -> Option<RegisterIdx> {
-        match r.0 {
-            0..=16 => Some(unsafe {mem::transmute(r.0 as u8)}),
-            // 33-48 - obsolete floating point registers
-            49 => Some(RegisterIdx::Flags),
-            // 50 - es
-            51 => Some(RegisterIdx::Cs),
-            52 => Some(RegisterIdx::Ss),
-            // 53 - ds
-            54 => Some(RegisterIdx::Fs),
-            55 => Some(RegisterIdx::Gs),
-            // 56-57 - reserved
-            58 => Some(RegisterIdx::FsBase),
-            59 => Some(RegisterIdx::GsBase),
-            _ => None,
+        Self::from_dwarf_arch(crate::disasm::Arch::X86_64, r)
+    }
+
+    pub fn from_dwarf_arch(arch: crate::disasm::Arch, r: gimli::Register) -> Option<RegisterIdx> {
+        match arch {
+            crate::disasm::Arch::X86_64 => match r.0 {
+                0..=16 => Some(unsafe {mem::transmute(r.0 as u8)}),
+                49 => Some(RegisterIdx::Flags),
+                51 => Some(RegisterIdx::Cs),
+                52 => Some(RegisterIdx::Ss),
+                54 => Some(RegisterIdx::Fs),
+                55 => Some(RegisterIdx::Gs),
+                58 => Some(RegisterIdx::FsBase),
+                59 => Some(RegisterIdx::GsBase),
+                _ => None,
+            },
+            crate::disasm::Arch::AArch64 => match r.0 {
+                0 => Some(RegisterIdx::Rax),
+                1 => Some(RegisterIdx::Ret),
+                8 => Some(RegisterIdx::Rbp),
+                29 => Some(RegisterIdx::Rbp),
+                30 => Some(RegisterIdx::Ret),
+                31 => Some(RegisterIdx::Rsp),
+                32 => Some(RegisterIdx::Rip),
+                _ => None,
+            },
+            crate::disasm::Arch::Riscv64 => match r.0 {
+                0 => Some(RegisterIdx::Rax),
+                1 => Some(RegisterIdx::Ret),
+                2 => Some(RegisterIdx::Rsp),
+                8 => Some(RegisterIdx::Rbp),
+                32 => Some(RegisterIdx::Rip),
+                _ => None,
+            },
         }
     }
 

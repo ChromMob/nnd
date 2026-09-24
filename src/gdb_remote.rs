@@ -127,9 +127,6 @@ impl GdbRemote {
 
     /// Send a packet and wait for its reply. Auto-acks when in ack mode.
     pub fn send_packet(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
-        if !self.no_ack {
-            // We are the client; the stub acks our packets with '+'.
-        }
         let pkt = gdbproto::encode_packet(payload);
         self.stream.write_all(&pkt)?;
         self.stream.flush()?;
@@ -188,7 +185,7 @@ impl GdbRemote {
     pub fn handshake(&mut self) -> Result<()> {
         let reply = self.send_packet(b"qSupported:swbreak+;hwbreak+;qXfer:features:read+;QStartNoAckMode+")?;
         self.qsupported = String::from_utf8_lossy(&reply).into_owned();
-        if let Some(sz) = parse_paket_size(&self.qsupported) {
+        if let Some(sz) = parse_packet_size(&self.qsupported) {
             self.packet_size = sz;
         }
         if self.qsupported.contains("QStartNoAckMode") {
@@ -341,16 +338,7 @@ impl GdbRemote {
     }
 
     pub fn cont(&mut self, tid: Option<u64>) -> Result<()> {
-        let pkt = match tid {
-            Some(t) => format!("vCont;c:{:x}", t),
-            None => "vCont;c".to_string(),
-        };
-        // vCont has no immediate reply; the next packet is a stop reply.
-        // We don't wait here — wait_stop() does.
-        let _ = pkt;
-        // Send without waiting for reply: write directly.
-        // But stub may send stop reply later. Use send then caller wait_stop.
-        // For simplicity send_packet would block waiting for stop — so write raw:
+        // vCont has no immediate reply; the next packet is a stop reply (wait_stop).
         let pkt = match tid {
             Some(t) => format!("vCont;c:{:x}", t),
             None => "vCont;c".to_string(),
@@ -469,7 +457,7 @@ impl GdbRemote {
     }
 }
 
-fn parse_paket_size(qsupported: &str) -> Option<usize> {
+fn parse_packet_size(qsupported: &str) -> Option<usize> {
     for part in qsupported.split(';') {
         if let Some(sz) = part.strip_prefix("PacketSize=") {
             if let Ok(n) = usize::from_str_radix(sz, 16) {

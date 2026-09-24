@@ -364,8 +364,9 @@ impl UnwindInfo {
         let mut new_regs = Registers::default();
         let mut seen_regs = 0usize; // to distinguish registers that were explicitly set to RegisterRule::Undefined from ones that weren't specified
         let mut found_return_address = false;
+        let arch = binary.arch();
         for (reg_num, rule) in row.registers() {
-            let reg = RegisterIdx::from_dwarf(*reg_num);
+            let reg = RegisterIdx::from_dwarf_arch(arch, *reg_num);
             if let &Some(r) = &reg {
                 seen_regs |= 1usize << r as u32;
             }
@@ -427,7 +428,7 @@ impl UnwindInfo {
 
         if !found_return_address {
             // According to libunwind: "Leaf function keeps the return address in register and there is no explicit intructions how to restore it"
-            let reg = match RegisterIdx::from_dwarf(fde.cie().return_address_register()) {
+            let reg = match RegisterIdx::from_dwarf_arch(arch, fde.cie().return_address_register()) {
                 None => return err!(Dwarf, "unrecognized return address register: {:?}", fde.cie().return_address_register()),
                 Some(r) => r };
             // Typically the return address register is just RIP, and for the root stack frame there's no RIP in new_regs.

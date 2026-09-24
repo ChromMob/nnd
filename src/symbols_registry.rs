@@ -34,6 +34,10 @@ impl Binary {
     pub fn symbols_loaded(&self) -> bool {
         !self.symbols.as_ref().is_err_and(|e| e.is_loading()) && !self.unwind.as_ref().is_err_and(|e| e.is_loading())
     }
+
+    pub fn arch(&self) -> crate::disasm::Arch {
+        self.elves.as_ref().ok().and_then(|e| e.first()).map(|e| e.arch()).unwrap_or(crate::disasm::Arch::X86_64)
+    }
 }
 
 // A binary explicitly provided by the user. We should use it in place of a corresponding binary mapped by the debuggee, if any. Matched by build id.

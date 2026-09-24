@@ -33,7 +33,7 @@ Development status:
  * I use it every day and find it very helpful.
  * Not in active development right now. I fix reported bugs and add small requested features, but likely won't get around to implementing big features soon (e.g. redesigning the watch expression language to have loops etc, Mac OS support, GUI, DAP).
 
-Distributed as a single 6 MB executable file with no dependencies.
+Distributed as a single executable. Statically links binutils libopcodes/libbfd (GPLv3); builds may also need libzstd at runtime.
 
 "Installation":
 ```bash

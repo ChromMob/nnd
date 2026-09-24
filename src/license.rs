@@ -3009,3 +3009,9 @@ dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 
 "###;
+
+// ======================== GNU GPL (binutils libopcodes) ========================
+// Disassembly links GNU binutils libopcodes/libbfd (GPLv3+). Pinned source and
+// build: third_party/build-opcodes.sh (binutils 2.47). Distributing statically
+// linked nnd binaries requires GPL compliance for those components.
+// https://www.gnu.org/licenses/gpl-3.0.html

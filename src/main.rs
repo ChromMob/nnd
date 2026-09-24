@@ -44,6 +44,9 @@ pub mod os;
 pub mod license;
 pub mod term_emu;
 pub mod syntax_highlight;
+pub mod gdbproto;
+pub mod gdb_remote;
+pub mod disasm;
 
 use crate::{elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*, core_dumper::*, os::*, registers::*};
 use std::{rc::Rc, mem, str, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr, path::PathBuf, collections::HashSet};
@@ -697,7 +700,3 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
         }
     }
 }
-
-pub mod gdbproto;
-pub mod gdb_remote;
-pub mod disasm;

@@ -1,7 +1,7 @@
 // Disassembly via binutils libopcodes (same engine GDB uses) — not a hand-rolled decoder.
 // Flow classification is a mnemonic table over the printed text (GDB layers gdbarch the same way).
 
-use std::ffi::{c_char, c_int, CStr, CString};
+use std::ffi::{c_char, c_int, CStr};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arch {
@@ -101,7 +101,8 @@ fn classify(arch: Arch, mnemonic: &str) -> FlowKind {
             }
             "beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu" | "beqz" | "bnez" | "blez" | "bgez"
             | "bltz" | "bgtz" | "bgt" | "ble" | "bgtu" | "bleu" => FlowKind::CondBranch,
-            "ecall" | "ebreak" | "c.ebreak" => FlowKind::Interrupt,
+            "ecall" => FlowKind::Syscall,
+            "ebreak" | "c.ebreak" => FlowKind::Interrupt,
             _ => {
                 // Compressed branches.
                 if mnemonic.starts_with("c.b") || mnemonic.starts_with("c.beqz") || mnemonic.starts_with("c.bnez") {
@@ -170,12 +171,6 @@ pub fn disassemble(arch: Arch, addr: u64, bytes: &[u8]) -> Insn {
         _ => None,
     };
     Insn { len: out.len as usize, text, mnemonic, targets, flow, branch_target }
-}
-
-/// Keep CString available for future symbol-aware printing; silence unused warnings.
-#[allow(dead_code)]
-fn _unused_cstring_guard() {
-    let _ = CString::new("x");
 }
 
 #[cfg(test)]
@@ -259,7 +254,7 @@ mod tests {
         // ecall
         let i = disassemble(Arch::Riscv64, 0x8000_0000, &[0x73, 0x00, 0x00, 0x00]);
         assert_eq!(i.mnemonic, "ecall");
-        assert_eq!(i.flow, FlowKind::Interrupt);
+        assert_eq!(i.flow, FlowKind::Syscall);
 
         // jal x0, 0 (j self)
         let i = disassemble(Arch::Riscv64, 0x8000_0000, &[0x6f, 0x00, 0x00, 0x00]);
