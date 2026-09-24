@@ -45,6 +45,8 @@ pub struct ElfNote<'a> {
 pub struct ElfFile {
     pub name: String, // just for logging
 
+    // ELF e_machine (EM_X86_64=62, EM_AARCH64=183, EM_RISCV=243).
+    pub machine: u16,
     pub segments: Vec<ElfSegment>,
     pub sections: Vec<ElfSection>,
     pub entry_point: usize,
@@ -100,6 +102,14 @@ pub struct CoreDumpMemReader {
 impl ElfFile {
     pub fn data(&self) -> &[u8] {
         self.data as _
+    }
+
+    pub fn arch(&self) -> crate::disasm::Arch {
+        match self.machine {
+            183 => crate::disasm::Arch::AArch64,
+            243 => crate::disasm::Arch::Riscv64,
+            _ => crate::disasm::Arch::X86_64,
+        }
     }
 
     // `offset` is an index into the string table section [section_offset, section_offset + section_size).
@@ -569,7 +579,7 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
 
     let data: &'static [u8] = unsafe {mem::transmute(data)};
 
-    let mut elf = ElfFile {name, mmapped, owned, data, segments, sections, entry_point, section_by_offset: Vec::new(), section_by_name: HashMap::new(), text_section: None, is_core_dump, build_id: None, r_debug_ptr_addr: None, interp: None};
+    let mut elf = ElfFile {name, machine: header.e_machine, mmapped, owned, data, segments, sections, entry_point, section_by_offset: Vec::new(), section_by_name: HashMap::new(), text_section: None, is_core_dump, build_id: None, r_debug_ptr_addr: None, interp: None};
 
     // Validate the section-name string table once, so bytes_from_strtab can scan it without per-byte bounds checks.
     // If it's missing/out-of-bounds/not null-terminated, section names are left empty rather than risking a bad read.

@@ -1,7 +1,7 @@
-use crate::{*, symbols::*, error::*, symbols_registry::*, util::*, procfs::*, settings::*, common_ui::*};
+use crate::{*, symbols::*, error::*, symbols_registry::*, util::*, procfs::*, settings::*, common_ui::*, disasm::{self, Arch, FlowKind}};
 use std::{fmt::Write, ops::Range, collections::HashSet};
-use iced_x86::*;
 
+// Upper bound on instruction length across supported arches (x86-64 is the widest at 15).
 pub const MAX_X86_INSTRUCTION_BYTES: usize = 15;
 
 // Disassembled function - a sequence of lines.
@@ -124,52 +124,6 @@ impl Disassembly {
     }
 }
 
-struct StyledFormatter<'a> {
-    palette: &'a Palette,
-    text: &'a mut StyledText,
-}
-
-impl<'a> FormatterOutput for StyledFormatter<'a> {
-    fn write(&mut self, text: &str, kind: FormatterTextKind) {
-        use FormatterTextKind::*;
-        let s = match kind {
-            Directive | Keyword => self.palette.disas_keyword,
-            Prefix | Mnemonic => self.palette.disas_mnemonic,
-            Register => self.palette.disas_register,
-            Number => self.palette.disas_number,
-            Function => self.palette.disas_function,
-            _ => self.palette.disas_default,
-        };
-
-        self.text.chars.push_str(text);
-        self.text.close_span(s);
-    }
-}
-
-struct Resolver<'a> {
-    symbols: Option<&'a Symbols>,
-    current_function: core::ops::Range<usize>,
-}
-
-impl<'a> SymbolResolver for Resolver<'a> {
-    fn symbol(&mut self, _: &Instruction, _operand: u32, _instruction_operand: Option<u32>, static_addr: u64, _address_size: u32) -> Option<SymbolResult<'a>> {
-        let static_addr = static_addr as usize;
-        if self.current_function.contains(&static_addr) {
-            // Make jumps inside current function easier to read: "_+42h" instead of "__futex_abstimed_wait_cancelable64+42h".
-            return Some(SymbolResult {address: self.current_function.start as u64, text: SymResTextInfo::new("_", FormatterTextKind::Function), flags: SymbolFlags::NONE, symbol_size: Some(MemorySize::UInt64)});
-        }
-
-        if let Some(symbols) = &self.symbols {
-            if let Ok((f, _)) = symbols.addr_to_function(static_addr) {
-                let name = f.demangle_name();
-                let text = SymResString::String(name);
-                return Some(SymbolResult {address: f.addr.addr().unwrap() as u64, text: SymResTextInfo::Text(SymResTextPart {text, color: FormatterTextKind::Function}), flags: SymbolFlags::NONE, symbol_size: Some(MemorySize::UInt64)});
-            }
-        }
-        None
-    }
-}
-
 pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Range<usize>>, symbols: Option<&Symbols>, code: Option<&[u8]>, intro: StyledText, palette: &Palette) -> Disassembly {
     clean_up_ranges(&mut static_addr_ranges);
 
@@ -213,13 +167,9 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
             res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Separator, static_addr: static_addr_range.start, ..Default::default()});
         }
 
-        let resolver = Resolver {symbols: symbols.clone(), current_function: static_addr_range.clone()};
-        // NasmFormatter wants to own the symbol resolver for some reason. (Probably it would be too inconvenient or inefficient to have lifetime argument all throughout the formatter implementation.)
-        // We trust that the SymbolResolver reference isn't retained after the formatter is destroyed, so it should be ok to fudge the lifetime here.
-        let resolver: Resolver<'static> = unsafe { std::mem::transmute(resolver) };
-
-        let mut decoder = Decoder::with_ip(64, code, static_addr_range.start as u64, DecoderOptions::NONE);
-        let mut formatter = NasmFormatter::with_options(Some(Box::new(resolver)), None);
+        let arch = symbols.map(|s| s.elves[0].arch()).unwrap_or(Arch::X86_64);
+        let mut code_pos = 0usize;
+        let mut ip = static_addr_range.start as u64;
 
         let mut line_iter = if let Some(symbols) = &symbols {
             let mut line_iter = symbols.addr_to_line_iter(static_addr_range.start).peekable();
@@ -229,17 +179,24 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
             None
         };
 
-        let mut instruction = Instruction::default();
         let mut prev_static_addr = 0usize;
         let mut cur_leaf_line: Option<LineInfo> = None;
 
-        while decoder.can_decode() {
-            decoder.decode_out(&mut instruction);
+        while code_pos < code.len() {
+            let insn = disasm::disassemble(arch, ip, &code[code_pos..]);
+            if insn.len == 0 {
+                // Undecodable: stop this range (error line appended below via with_error on a temp).
+                styled_writeln!(res.text, palette.error, "failed to decode instruction at 0x{:x}", ip);
+                res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Error, static_addr: usize::MAX, ..Default::default()});
+                res.error = Some(error!(Dwarf, "failed to decode instruction at 0x{:x}", ip));
+                break;
+            }
+            let instruction_ip = ip as usize;
 
             if let Some(l) = res.lines.last() {
-                assert!(instruction.ip() as usize >= l.static_addr); // can be == because the "-----[...]" separator above is assigned to address of the first instruction after it
+                assert!(instruction_ip >= l.static_addr); // can be == because the "-----[...]" separator above is assigned to address of the first instruction after it
             }
-            let static_addr = instruction.ip() as usize;
+            let static_addr = instruction_ip;
             let mut subfunction_level = 0u16;
             let mut cur_subfunction: Option<usize> = None;
             let mut is_statement = false;
@@ -308,33 +265,45 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
             prev_static_addr = static_addr;
 
             let mut jump_target: Option<usize> = None;
-            let jump_indicator = match instruction.flow_control() {
-                FlowControl::Next => ' ',
-                FlowControl::Return => '←',
-                FlowControl::Call | FlowControl::IndirectCall => '→',
-                FlowControl::Interrupt | FlowControl::XbeginXabortXend | FlowControl::Exception => '!',
-                FlowControl::UnconditionalBranch | FlowControl::IndirectBranch | FlowControl::ConditionalBranch => {
-                    let target_known = instruction.flow_control() != FlowControl::IndirectBranch && match instruction.op0_kind() {
-                        iced_x86::OpKind::NearBranch16 | iced_x86::OpKind::NearBranch32 | iced_x86::OpKind::NearBranch64 => true,
-                        _ => false };
-                    if !target_known {
-                        '↕'
+            let jump_indicator = match insn.flow {
+                FlowKind::Normal => ' ',
+                FlowKind::Return => '←',
+                FlowKind::Call => '→',
+                FlowKind::Syscall | FlowKind::Interrupt => '!',
+                FlowKind::UncondBranch | FlowKind::CondBranch => match insn.branch_target {
+                    None => '↕',
+                    Some(t) => {
+                        jump_target = Some(t as usize);
+                        if t as usize > static_addr { '↓' } else { '↑' }
+                    }
+                },
+            };
+
+            // Instruction text from binutils; lightly substitute branch targets with symbols.
+            let mut text_out = insn.text;
+            if let (Some(symbols), Some(t)) = (symbols, insn.branch_target) {
+                if let Ok((f, _)) = symbols.addr_to_function(t as usize) {
+                    let name = if static_addr_range.contains(&(t as usize)) {
+                        "_".to_string()
                     } else {
-                        jump_target = Some(instruction.near_branch_target() as usize);
-                        if instruction.near_branch_target() > instruction.ip() {
-                            '↓'
-                        } else {
-                            '↑'
+                        f.demangle_name()
+                    };
+                    let off = (t as usize).wrapping_sub(f.addr.addr().unwrap_or(t as usize));
+                    let repl = if off == 0 { name } else if name == "_" { format!("_+0x{:x}", off) } else { format!("{}+0x{:x}", name, off) };
+                    for hex in [format!("0x{:x}", t), format!("0x{:X}", t), format!("{:x}", t)] {
+                        if text_out.contains(&hex) {
+                            text_out = text_out.replace(&hex, &repl);
+                            break;
                         }
                     }
                 }
-            };
-
-            // Finally write the actual asm instruction.
-            formatter.format(&instruction, &mut StyledFormatter {palette, text: &mut res.text});
-
+            }
+            styled_write!(res.text, palette.disas_mnemonic, "{}", text_out);
             res.text.close_line();
             res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Instruction, static_addr, relative_addr: static_addr as isize - static_addr_range.start as isize, subfunction_level, jump_indicator, jump_target, is_statement, leaf_line: cur_leaf_line.clone(), subfunction: cur_subfunction.clone()});
+
+            code_pos += insn.len;
+            ip = static_addr as u64 + insn.len as u64;
         }
     }
     res.finish()

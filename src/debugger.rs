@@ -1,6 +1,5 @@
 use crate::{*, elf::*, error::*, util::*, log::*, symbols::*, process_info::*, symbols_registry::*, unwind::*, procfs::*, registers::*, disassembly::*, pool::*, settings::*, context::*, disassembly::*, expr::*, persistent::*, interp::*, os::*, term_emu::*, gdb_remote::{self, GdbRemote, GdbError, StopKind}};
 use libc::{pid_t, c_char, c_void};
-use iced_x86::FlowControl;
 use std::{io, ptr, rc::Rc, collections::{HashMap, VecDeque, HashSet, hash_map::Entry}, mem, path::{Path, PathBuf}, sync::{Arc, Mutex}, ffi::CStr, ops::Range, os::fd::AsRawFd, fs, time::{Instant, Duration}};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -1468,7 +1467,8 @@ impl Debugger {
         Ok(())
     }
 
-    fn make_instruction_decoder<'a>(&self, range: Range<usize>, buf: &'a mut Vec<u8>) -> Result<iced_x86::Decoder<'a>> {
+    /// Read [range) from the debuggee, restoring software-breakpoint bytes, for disassembly.
+    fn load_code_for_decode(&self, range: Range<usize>, buf: &mut Vec<u8>) -> Result<()> {
         if range.len() > 100_000_000 { return err!(Sanity, "{} MB code range, suspiciously long", range.len() / 1_000_000); }
         buf.resize(range.len(), 0);
         self.memory.read(range.start, buf)?;
@@ -1483,17 +1483,24 @@ impl Debugger {
                 buf[b.addr - range.start] = b.original_byte;
             }
         }
-        Ok(iced_x86::Decoder::with_ip(64, buf, range.start as u64, 0))
+        Ok(())
     }
 
-    fn jump_target_may_be_outside_ranges(instruction: &iced_x86::Instruction, ranges: &[Range<usize>]) -> bool {
-        if instruction.flow_control() == FlowControl::IndirectBranch {
-            return true;
+    fn arch_for_step(&self, binary_id: Option<usize>) -> crate::disasm::Arch {
+        binary_id
+            .and_then(|id| self.symbols.get(id))
+            .and_then(|b| b.elves.as_ref().ok())
+            .and_then(|elves| elves.first())
+            .map(|e| e.arch())
+            .unwrap_or(crate::disasm::Arch::X86_64)
+    }
+
+    fn jump_target_may_be_outside_ranges(insn: &crate::disasm::Insn, ranges: &[Range<usize>]) -> bool {
+        match insn.flow {
+            crate::disasm::FlowKind::UncondBranch | crate::disasm::FlowKind::CondBranch | crate::disasm::FlowKind::Call => (),
+            _ => return true,
         }
-        match instruction.op0_kind() {
-            iced_x86::OpKind::NearBranch16 | iced_x86::OpKind::NearBranch32 | iced_x86::OpKind::NearBranch64 => (),
-            _ => return true }
-        let addr = instruction.near_branch_target() as usize;
+        let Some(addr) = insn.branch_target.map(|t| t as usize) else { return true };
         let i = ranges.partition_point(|r| r.end <= addr);
         i == ranges.len() || ranges[i].start > addr
     }
@@ -1584,7 +1591,7 @@ impl Debugger {
             
             // Decode one instruction to check if it's a call/syscall, just as an optimization to avoid suspending other threads unnecessarily.
             // (This read will incorrectly fail if we're <15 bytes before end of mmap.)
-            match self.make_instruction_decoder(addr..addr+MAX_X86_INSTRUCTION_BYTES, &mut buf) {
+            match self.load_code_for_decode(addr..addr+MAX_X86_INSTRUCTION_BYTES, &mut buf) {
                 // Allow single-instruction-stepping even if we can't read the process's memory for some reason.
                 Err(e) if kind == StepKind::Into => {
                     eprintln!("warning: failed to read instruction at {:x}: {}", addr, e);
@@ -1592,12 +1599,14 @@ impl Debugger {
                     step.keep_other_threads_suspended = false;
                 }
                 Err(e) => return Err(e),
-                Ok(mut decoder) => {
-                    let instruction = decoder.decode();
-                    let is_syscall = instruction.code() == iced_x86::Code::Syscall;
-                    let is_call = [FlowControl::Call, FlowControl::IndirectCall].contains(&instruction.flow_control());
+                Ok(()) => {
+                    let arch = self.arch_for_step(frame.binary_id.as_ref().ok().copied());
+                    let instruction = crate::disasm::disassemble(arch, addr as u64, &buf);
+                    let insn_len = if instruction.len == 0 { 1 } else { instruction.len };
+                    let is_syscall = matches!(instruction.flow, crate::disasm::FlowKind::Syscall);
+                    let is_call = instruction.flow == crate::disasm::FlowKind::Call;
                     step.keep_other_threads_suspended &= !is_syscall;
-                    step.addr_ranges.push(addr..addr+instruction.len()); // may be unset later
+                    step.addr_ranges.push(addr..addr+insn_len); // may be unset later
                     if kind == StepKind::Into || !is_call {
                         step.internal_kind = StepKind::Into;
                     } else {
@@ -1908,25 +1917,35 @@ impl Debugger {
         let bp_on_call = breakpoint_types.contains(&StepBreakpointType::Call);
         let bp_on_jump_out = breakpoint_types.contains(&StepBreakpointType::JumpOut);
         if bp_on_call || bp_on_jump_out {
-            let mut decoder = self.make_instruction_decoder(addr_range.clone(), buf)?;
-            let mut instruction = iced_x86::Instruction::default();
-            while decoder.can_decode() {
-                decoder.decode_out(&mut instruction);
+            self.load_code_for_decode(addr_range.clone(), buf)?;
+            let arch = crate::disasm::Arch::X86_64; // step ranges come from the debuggee; native default
+            let mut off = 0usize;
+            while off < buf.len() {
+                let ip = addr_range.start + off;
+                let insn = crate::disasm::disassemble(arch, ip as u64, &buf[off..]);
+                if insn.len == 0 { break; }
                 if skip_first_instruction {
                     skip_first_instruction = false;
+                    off += insn.len;
                     continue;
                 }
-                match instruction.flow_control() {
-                    FlowControl::Call if instruction.code() == iced_x86::Code::Syscall => *out_may_do_syscalls = true,
-                    FlowControl::Call | FlowControl::IndirectCall if bp_on_call => breakpoints_to_add.push((StepBreakpointType::Call, instruction.ip() as usize)),
-                    FlowControl::Call | FlowControl::IndirectCall => *out_may_do_syscalls = true,
-                    FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch | FlowControl::IndirectBranch => {
-                        if bp_on_jump_out && Self::jump_target_may_be_outside_ranges(&instruction, all_addr_ranges) {
-                            breakpoints_to_add.push((StepBreakpointType::JumpOut, instruction.ip() as usize));
+                match insn.flow {
+                    crate::disasm::FlowKind::Syscall => *out_may_do_syscalls = true,
+                    crate::disasm::FlowKind::Call => {
+                        if bp_on_call {
+                            breakpoints_to_add.push((StepBreakpointType::Call, ip));
+                        } else {
+                            *out_may_do_syscalls = true;
                         }
                     }
-                    FlowControl::Return | FlowControl::Next | FlowControl::XbeginXabortXend | FlowControl::Exception | FlowControl::Interrupt => (),
+                    crate::disasm::FlowKind::UncondBranch | crate::disasm::FlowKind::CondBranch => {
+                        if bp_on_jump_out && Self::jump_target_may_be_outside_ranges(&insn, all_addr_ranges) {
+                            breakpoints_to_add.push((StepBreakpointType::JumpOut, ip));
+                        }
+                    }
+                    crate::disasm::FlowKind::Return | crate::disasm::FlowKind::Normal | crate::disasm::FlowKind::Interrupt => (),
                 }
+                off += insn.len;
             }
         }
         Ok(())
@@ -3794,7 +3813,7 @@ pub fn default_x86_64_gdb_regs() -> Vec<(String, u32, u64)> {
         n += 1;
     }
     v.push(("fs_base".into(), 64, n)); n += 1;
-    v.push(("gs_base".into(), 64, n)); n += 1;
+    v.push(("gs_base".into(), 64, n));
     v
 }
 

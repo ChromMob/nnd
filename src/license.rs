@@ -2740,8 +2740,6 @@ SOFTWARE.
 ======================== MIT License ========================
 
 Used by:
- * iced-x86 1.21.0
-   https://github.com/icedland/iced
  * tree-sitter-cpp 0.23.4
    https://github.com/tree-sitter/tree-sitter-cpp
  * tree-sitter-odin 1.3.0

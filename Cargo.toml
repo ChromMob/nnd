@@ -29,7 +29,6 @@ debug = true
 
 [dependencies]
 libc = "0.2.146" # syscall wrappers
-iced-x86 = {version = "1.19", default-features = false, features = ["std", "decoder", "instr_info", "nasm"]} # disassember
 bitflags = "^1.3" # TODO: update to 2.*
 gimli = {version = "^0.31.1", default-features = false, features = ["std", "read"]} # TODO: remove the remaining usage (e.g. evaluating line number programs and dwarf expressions) and delet dis
 #gimli = {path = "/home/al13n/Dropbox/coding/gimli"}
