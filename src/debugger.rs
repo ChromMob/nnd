@@ -695,8 +695,10 @@ impl Debugger {
         if conn.set_thread(tid as u64).is_err() { return; }
         let Ok(raw) = conn.read_regs_raw() else { return };
         drop(conn);
+        let gregs = decode_gdb_named_regs(&layout, &raw);
         if let Some(t) = self.threads.get_mut(&tid) {
             t.info.regs = registers_from_gdb(&layout, &raw);
+            t.info.remote_gregs = Some(gregs);
             t.info.extra_regs.reset_with_tid(tid);
         }
     }
@@ -1212,7 +1214,9 @@ impl Debugger {
     }
 
     pub fn refresh_all_resource_stats(&mut self) {
-        if let Some(error) = refresh_all_resource_stats(self.pid, &mut self.my_resource_stats, &mut self.info.total_resource_stats, &mut self.threads, &mut self.prof.bucket, &self.context.settings) {
+        // Remote stub tids are not host pids; only refresh nnd's own stats.
+        let host_pid = if self.mode.is_remote() { 0 } else { self.pid };
+        if let Some(error) = refresh_all_resource_stats(host_pid, &mut self.my_resource_stats, &mut self.info.total_resource_stats, &mut self.threads, &mut self.prof.bucket, &self.context.settings) {
             eprintln!("failed to refresh resource stats: {}", error);
         }
     }
@@ -2326,11 +2330,15 @@ impl Debugger {
     }
 
     pub fn make_eval_context<'a>(&'a self, stack: &'a StackTrace, selected_subframe: usize, tid: pid_t) -> EvalContext<'a> {
-        let (extra_regs, fs_base) = match self.threads.get(&tid) {
-            Some(t) => (Some(&t.info.extra_regs), if t.info.regs.has(RegisterIdx::FsBase) {Some(t.info.regs.get(RegisterIdx::FsBase).unwrap().0)} else {None}),
-            None => (None, None),
+        let (extra_regs, fs_base, remote_gregs) = match self.threads.get(&tid) {
+            Some(t) => (
+                Some(&t.info.extra_regs),
+                if t.info.regs.has(RegisterIdx::FsBase) {Some(t.info.regs.get(RegisterIdx::FsBase).unwrap().0)} else {None},
+                t.info.remote_gregs.as_deref(),
+            ),
+            None => (None, None, None),
         };
-        EvalContext {memory: CachedMemReader::new(self.memory.clone()), process_info: &self.info, symbols_registry: &self.symbols, stack, selected_subframe, extra_regs, fs_base}
+        EvalContext {memory: CachedMemReader::new(self.memory.clone()), process_info: &self.info, symbols_registry: &self.symbols, stack, selected_subframe, extra_regs, fs_base, remote_gregs}
     }
 
     pub fn add_breakpoint(&mut self, on: BreakpointOn) -> Result<BreakpointId> {
@@ -3960,6 +3968,27 @@ pub fn registers_from_gdb(layout: &[(String, u32, u64)], raw: &[u8]) -> Register
         }
     }
     r
+}
+
+/// Decode every register in the g-packet layout to (target_name, value), stopping when bytes run out.
+/// Used for the register watch window so remote sessions show pc/sp/ra instead of x86 names.
+pub fn decode_gdb_named_regs(layout: &[(String, u32, u64)], raw: &[u8]) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for (name, bits, _) in layout {
+        let nbytes = ((*bits as usize) + 7) / 8;
+        if offset + nbytes > raw.len() {
+            break;
+        }
+        let mut val = 0u64;
+        let take = nbytes.min(8);
+        for i in 0..take {
+            val |= (raw[offset + i] as u64) << (8 * i);
+        }
+        offset += nbytes;
+        out.push((name.clone(), val));
+    }
+    out
 }
 
 /// Build synthetic MemMapsInfo from user-supplied ELF files' PT_LOAD segments (remote mode).

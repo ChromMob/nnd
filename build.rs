@@ -1,48 +1,60 @@
-// Build multi-arch libopcodes (third_party/build-opcodes.sh) and the C shim.
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let tp = manifest.join("third_party");
-    let out = tp.join("opcodes-out");
-    let shim = tp.join("nnd_disasm.c");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let cwd = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let tp = cwd.join("third_party");
+    let script = tp.join("build-opcodes.sh");
+    let opcodes_out = tp.join("opcodes-out");
 
-    println!("cargo:rerun-if-changed={}", tp.join("build-opcodes.sh").display());
-    println!("cargo:rerun-if-changed={}", shim.display());
+    println!("cargo:rerun-if-changed={}", script.display());
+    println!("cargo:rerun-if-changed={}", tp.join("nnd_disasm.c").display());
     println!("cargo:rerun-if-changed={}", tp.join("nnd_disasm.h").display());
-    println!("cargo:rerun-if-changed={}", manifest.join("Cargo.toml").display());
+    println!("cargo:rerun-if-changed={}", cwd.join("Cargo.toml").display());
+    println!("cargo:rerun-if-changed={}", cwd.join("build.rs").display());
 
-    let stamp = out.join(".stamp");
-    if !stamp.exists() || !out.join("lib/libopcodes.a").exists() {
-        let status = Command::new("bash")
-            .arg(tp.join("build-opcodes.sh"))
-            .current_dir(&tp)
-            .status()
-            .expect("failed to run third_party/build-opcodes.sh (needs curl, make, gcc)");
-        if !status.success() {
-            panic!("third_party/build-opcodes.sh failed with {}", status);
-        }
+    // Build libopcodes if the stamp is missing/stale (script self-checks).
+    let status = Command::new("bash")
+        .arg(&script)
+        .current_dir(&cwd)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run {}: {e}", script.display()));
+    if !status.success() {
+        panic!(
+            "{} failed with {status}; see output above",
+            script.display()
+        );
     }
 
-    cc::Build::new()
-        .file(&shim)
-        .include(&out.join("include"))
-        .include(&tp)
-        .flag_if_supported("-Wno-unused-parameter")
-        .compile("nnd_disasm");
-
-    let lib = out.join("lib");
-    println!("cargo:rustc-link-search=native={}", lib.display());
-    // Order matters: opcodes pulls from bfd, both pull iberty/z/zstd.
+    let include = opcodes_out.join("include");
+    println!("cargo:rustc-link-search=native={}", opcodes_out.display());
+    // Link order: opcodes depends on bfd/sframe/iberty/z.
     println!("cargo:rustc-link-lib=static=opcodes");
     println!("cargo:rustc-link-lib=static=bfd");
-    println!("cargo:rustc-link-lib=static=sframe");
+    if opcodes_out.join("libsframe.a").exists() {
+        println!("cargo:rustc-link-lib=static=sframe");
+    }
+    if opcodes_out.join("libz.a").exists() {
+        println!("cargo:rustc-link-lib=static=z");
+    }
     println!("cargo:rustc-link-lib=static=iberty");
-    println!("cargo:rustc-link-lib=static=z");
-    // zstd is only available as a shared lib on this system; bfd may need it.
+    println!("cargo:rustc-link-lib=dylib=z");
     println!("cargo:rustc-link-lib=dylib=zstd");
     println!("cargo:rustc-link-lib=dylib=m");
     println!("cargo:rustc-link-lib=dylib=dl");
+
+    let mut build = cc::Build::new();
+    build
+        .file(tp.join("nnd_disasm.c"))
+        .include(&include)
+        .include(&tp)
+        .warnings(false);
+    // Some binutils headers are C99 with GNU extensions.
+    build.flag_if_supported("-std=gnu11");
+    build.compile("nnd_disasm");
+
+    // Keep OUT_DIR referenced so rebuilds notice (object lands there).
+    let _ = out_dir;
 }

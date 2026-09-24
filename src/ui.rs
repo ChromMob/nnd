@@ -1,4 +1,4 @@
-use crate::{*, debugger::*, error::*, log::*, symbols::*, symbols_registry::*, util::*, registers::*, procfs::*, unwind::*, disassembly::*, pool::*, layout::*, settings::*, context::*, types::*, expr::*, widgets::*, search::*, arena::*, interp::*, imgui::*, common_ui::*, terminal::*, doc::*, os::*, term_emu::*};
+use crate::{*, debugger::*, error::*, log::*, symbols::*, symbols_registry::*, util::*, registers::*, procfs::*, unwind::*, disassembly::*, pool::*, layout::*, settings::*, context::*, types::*, expr::*, widgets::*, search::*, arena::*, interp::*, imgui::*, common_ui::*, terminal::*, doc::*, os::*, term_emu::*, disasm::Arch};
 use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry, VecDeque}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt, sync::{Arc}, time::Duration};
 use libc::{self, pid_t};
 use rand::random;
@@ -84,6 +84,9 @@ struct DisassemblyScrollTarget {
     static_pseudo_addr: usize,
     subfunction_level: u16,
     cascade: bool, // scroll source as well
+    // If Some, disassemble this runtime address from memory without requiring a mapped binary
+    // (e.g. remote guest PC outside the provided ELF's link addresses). Unwind may still fail.
+    raw_addr: Option<usize>,
 }
 
 pub trait WindowContent {
@@ -761,12 +764,21 @@ impl WatchesWindow {
     fn eval_registers(&mut self, context: &mut EvalContext, parent: ValueTreeNodeIdx, palette: &Palette) {
         if let Some(sf) = context.stack.subframes.get(context.selected_subframe) {
             let regs = &context.stack.frames[sf.frame_idx].regs;
+            if let Some(gregs) = context.remote_gregs.as_ref() {
+                // Remote stub: list registers by the target's own names (pc/sp/ra/... not rax/rip).
+                for (i, (name, v)) in gregs.iter().enumerate() {
+                    let l = styled_writeln!(self.tree.text, palette.default, "{}", name);
+                    let value = Value {val: AddrOrValueBlob::Blob(ValueBlob::new(*v as usize)), type_: self.eval_state.builtin_types.u64_, flags: ValueFlags::HEX};
+                    self.tree.add(ValueTreeNode {name: l..l+1, value: Ok(value), dubious: false, identity: hash(&("rg", i, name)), parent, ..D!()});
+                }
+            } else {
             for reg in RegisterIdx::all() {
                 if let Ok((v, dubious)) = regs.get(*reg) {
                     let l = styled_writeln!(self.tree.text, palette.default, "{}", reg);
                     let value = Value {val: AddrOrValueBlob::Blob(ValueBlob::new(v as usize)), type_: self.eval_state.builtin_types.u64_, flags: ValueFlags::HEX};
                     self.tree.add(ValueTreeNode {name: l..l+1, value: Ok(value), dubious, identity: hash(&reg), parent, ..D!()});
                 }
+            }
             }
             if let Some(extra_regs) = context.extra_regs.clone() {
                 for (name, regs) in ExtraRegisterIdx::groups_for_ui() {
@@ -1196,7 +1208,7 @@ impl WatchesWindow {
                 ui.should_redraw = true;
             }
             &ValueClickAction::Function {binary_id, function_idx, static_addr} => {
-                let target = DisassemblyScrollTarget {binary_id, function_idx, static_pseudo_addr: static_addr, subfunction_level: 0, cascade: true};
+                let target = DisassemblyScrollTarget {binary_id, function_idx, static_pseudo_addr: static_addr, subfunction_level: 0, cascade: true, raw_addr: None};
                 state.should_scroll_disassembly = Some((Ok(target), /*only_if_on_error_tab*/ false));
                 ui.should_redraw = true;
             }
@@ -1850,12 +1862,15 @@ struct DisassemblyTab {
     // But if the cursor is inside some inlined functions, which of them do we scroll to? This depth number determines that.
     // This indentation level is highlighted.
     selected_subfunction_level: u16,
+    // Runtime address to disassemble from memory without a mapped function/binary.
+    raw_addr: Option<usize>,
 
     area_state: AreaState,
 }
 
 struct DisassemblyWindow {
     tabs: Vec<DisassemblyTab>,
+    raw_cache: HashMap<usize, Disassembly>,
     cache: HashMap<(/*binary_id*/ usize, /*function_idx*/ usize), Disassembly>,
     tabs_state: TabsState,
     search_dialog: Option<SearchDialog>,
@@ -1864,7 +1879,7 @@ struct DisassemblyWindow {
     source_scrolled_to: Option<(/*binary_id*/ usize, /*function_idx*/ usize, /*disas_line*/ usize, /*selected_subfunction_level*/ u16)>,
 }
 
-impl Default for DisassemblyWindow { fn default() -> Self { Self {tabs: Vec::new(), cache: HashMap::new(), tabs_state: TabsState::default(), search_dialog: None, go_to_address_bar: SearchBar::default(), go_to_address_error: None, source_scrolled_to: None} } }
+impl Default for DisassemblyWindow { fn default() -> Self { Self {tabs: Vec::new(), cache: HashMap::new(), raw_cache: HashMap::new(), tabs_state: TabsState::default(), search_dialog: None, go_to_address_bar: SearchBar::default(), go_to_address_error: None, source_scrolled_to: None} } }
 
 impl DisassemblyWindow {
     fn open_function(&mut self, target: Result<DisassemblyScrollTarget>, debugger: &Debugger) -> Result<()> {
@@ -1878,6 +1893,15 @@ impl DisassemblyWindow {
                 return Ok(());
             }
         };
+        if let Some(raw) = target.raw_addr {
+            let title = format!("{:x}", raw);
+            self.tabs.push(DisassemblyTab {
+                identity: random(), title, locator: None, error: None,
+                raw_addr: Some(raw), ephemeral: true, cached_function_idx: None,
+                selected_subfunction_level: 0, ..Default::default()});
+            self.tabs_state.select(self.tabs.len() - 1);
+            return Ok(());
+        }
         for i in 0..self.tabs.len() {
             if let Some((binary, function_idx)) = self.resolve_function_for_tab(i, debugger) {
                 if binary.id == target.binary_id && function_idx == target.function_idx {
@@ -1927,7 +1951,7 @@ impl DisassemblyWindow {
                 Some(x) => x,
                 None => return err!(Usage, "no open function"),
             };
-            Ok(DisassemblyScrollTarget {binary_id, function_idx, static_pseudo_addr: function_locator.addr.0.saturating_add(addr), subfunction_level: SUBFUNCTION_LEVEL_MAX, cascade: true})
+            Ok(DisassemblyScrollTarget {binary_id, function_idx, static_pseudo_addr: function_locator.addr.0.saturating_add(addr), subfunction_level: SUBFUNCTION_LEVEL_MAX, cascade: true, raw_addr: None})
         } else {
             let (static_addr, binary) = match debugger.addr_to_binary(addr) {
                 Ok((_, static_addr, binary, _)) => (static_addr, binary),
@@ -1954,7 +1978,7 @@ impl DisassemblyWindow {
             };
             let symbols = binary.symbols.as_ref_clone_error()?;
             let (function, function_idx) = symbols.addr_to_function(static_addr)?;
-            Ok(DisassemblyScrollTarget {binary_id: binary.id, function_idx, static_pseudo_addr: static_addr, subfunction_level: SUBFUNCTION_LEVEL_MAX, cascade: true})
+            Ok(DisassemblyScrollTarget {binary_id: binary.id, function_idx, static_pseudo_addr: static_addr, subfunction_level: SUBFUNCTION_LEVEL_MAX, cascade: true, raw_addr: None})
         }
     }
 
@@ -2040,6 +2064,21 @@ impl DisassemblyWindow {
         Some((binary, function_idx))
     }
 
+    fn find_or_disassemble_raw(_cache: &mut HashMap<usize, Disassembly>, debugger: &Debugger, addr: usize, palette: &Palette) -> Result<Disassembly> {
+        // 256 bytes of memory is cheap to disassemble every frame; Disassembly isn't Clone.
+        let arch = debugger.symbols.iter()
+            .filter_map(|b| b.elves.as_ref().ok())
+            .find_map(|e| e.first().map(|elf| elf.arch()))
+            .unwrap_or(Arch::X86_64);
+        let mut buf = vec![0u8; 256];
+        debugger.memory.read(addr, &mut buf)?;
+        let mut intro = StyledText::default();
+        styled_writeln!(intro, palette.default_dim, "raw memory @ 0x{:x} — not in any loaded binary (unwind may fail)", addr);
+        intro.close_line();
+        intro.close_line();
+        Ok(disassemble_function(0, vec![addr..addr + buf.len()], None, Some(&buf), intro, palette, arch))
+    }
+
     fn find_or_disassemble_function<'a>(cache: &'a mut HashMap<(usize, usize), Disassembly>, binary: &Binary, function_idx: usize, palette: &Palette) -> &'a Disassembly {
         let indent_width = str_width(&palette.tree_indent.0);
         let e = cache.entry((binary.id, function_idx));
@@ -2080,14 +2119,15 @@ impl DisassemblyWindow {
         // TODO: Print declaration site. Scroll code window to it when selected.
         // TODO: Print number of inlined call sites. Allow setting breakpoint on it.
 
-        Ok(disassemble_function(function_idx, ranges, Some(symbols.as_ref()), None, prelude, palette))
+        let arch = binary.elves.as_ref().ok().and_then(|e| e.first()).map(|elf| elf.arch()).unwrap_or(Arch::X86_64);
+        Ok(disassemble_function(function_idx, ranges, Some(symbols.as_ref()), None, prelude, palette, arch))
     }
 
     fn close_error_tab(&mut self) -> Option<usize> {
         if self.tabs.is_empty() {
             return None;
         }
-        if let Some(i) = self.tabs.iter().position(|t| t.locator.is_none()) {
+        if let Some(i) = self.tabs.iter().position(|t| t.locator.is_none() && t.error.is_some()) {
             self.tabs.remove(i);
             if self.tabs_state.selected == i {
                 return None;
@@ -2135,7 +2175,7 @@ impl DisassemblyWindow {
         }
 
         if let Some(res) = mem::take(&mut d.should_open_document) {
-            match self.open_function(Ok(DisassemblyScrollTarget {binary_id: res.binary_id, function_idx: res.id, static_pseudo_addr: 0, subfunction_level: SUBFUNCTION_LEVEL_MAX, cascade: true}), debugger) {
+            match self.open_function(Ok(DisassemblyScrollTarget {binary_id: res.binary_id, function_idx: res.id, static_pseudo_addr: 0, subfunction_level: SUBFUNCTION_LEVEL_MAX, cascade: true, raw_addr: None}), debugger) {
                 Ok(()) => self.tabs[self.tabs_state.selected].ephemeral = false,
                 Err(e) => log!(debugger.log, "{}", e),
             }
@@ -2219,6 +2259,75 @@ impl DisassemblyWindow {
             Some(x) => x };
 
         let start = ui.text.num_lines();
+
+        // Raw memory listing (no mapped binary — e.g. remote guest PC outside ELF link addresses).
+        if let Some(raw) = tab.raw_addr {
+            let raw = raw;
+            let disas = match Self::find_or_disassemble_raw(&mut self.raw_cache, debugger, raw, &ui.palette) {
+                Ok(d) => d,
+                Err(e) => Disassembly::new().with_error(e, &ui.palette),
+            };
+            if let Some((static_pseudo_addr, _)) = scroll_to_addr {
+                let line = disas.static_pseudo_addr_to_line(static_pseudo_addr).0;
+                self.tabs[self.tabs_state.selected].area_state.select(line);
+            }
+            let rel_addr_digits = (((disas.max_abs_relative_addr as f64 + 1.0).log2() / 4.0).ceil() as usize).max(1);
+            let prefix_width = 2 + 2 + 12+1 + rel_addr_digits+4 + 2 + 1;
+            // Header: note this is unmapped raw memory.
+            styled_writeln!(ui.text, ui.palette.default_dim, "0x{:x} (no symbols for this address)", raw);
+            ui.text.close_line();
+            // Emit instruction lines (identity addr map: static_addr == runtime addr).
+            let mut ip_lines: Vec<(usize, bool)> = Vec::new();
+            for (idx, frame) in state.stack.frames.iter().enumerate() {
+                if frame.addr == raw || frame.pseudo_addr == raw {
+                    let (line, found) = disas.static_pseudo_addr_to_line(raw);
+                    if found { ip_lines.push((line, idx == state.selected_frame)); }
+                }
+            }
+            ip_lines.sort_unstable_by_key(|k| (k.0, !k.1));
+            {
+                let line_range = 0..disas.lines.len();
+                for i in line_range {
+                    let line = &disas.lines[i];
+                    if line.kind == DisassemblyLineKind::Instruction {
+                        let addr = line.static_addr;
+                        let ip_idx = ip_lines.partition_point(|x| x.0 < i);
+                        if ip_idx == ip_lines.len() || ip_lines[ip_idx].0 != i {
+                            ui_write!(ui, default, "  ");
+                        } else if ip_lines[ip_idx].1 {
+                            ui_write!(ui, instruction_pointer, "\u{2b95} ");
+                        } else {
+                            ui_write!(ui, additional_instruction_pointer, "\u{2b95} ");
+                        }
+                        ui_write!(ui, secondary_breakpoint, "  ");
+                        let addr_style = ui.palette.disas_address_not_statement;
+                        styled_write!(ui.text, addr_style, "{:012x} ", addr);
+                        ui_write!(ui, disas_relative_address, "<{: >+1$x}> ", line.relative_addr, rel_addr_digits + 1);
+                        ui_write!(ui, disas_jump_arrow, " {} ", line.jump_indicator);
+                        // Append the already-styled instruction text as one more span run via raw write of line content:
+                        // disas.text line i corresponds to this line.
+                        let src_line = i.min(disas.text.num_lines().saturating_sub(1));
+                        let s = disas.text.get_line_str(src_line);
+                        ui_write!(ui, disas_default, "{}", s);
+                        ui.text.close_line();
+                    } else if line.kind == DisassemblyLineKind::Error {
+                        ui_writeln!(ui, error, "{}", disas.text.get_line_str(i.min(disas.text.num_lines().saturating_sub(1))));
+                    } else if line.kind == DisassemblyLineKind::Intro || line.kind == DisassemblyLineKind::LeafLineNumber {
+                        let src_line = i.min(disas.text.num_lines().saturating_sub(1));
+                        ui_writeln!(ui, default_dim, "{}", disas.text.get_line_str(src_line));
+                    } else {
+                        ui.text.close_line();
+                    }
+                }
+            }
+            let end = ui.text.num_lines();
+            let tab = self.tabs.get_mut(self.tabs_state.selected).unwrap();
+            with_parent!(ui, content_root, {
+                build_biscrollable_area_with_header(None, start..end, [prefix_width + disas.widest_line, disas.lines.len()], &mut tab.area_state, ui);
+            });
+            return;
+        }
+
         if let Some(locator) = &tab.locator {
             ui_writeln!(ui, function_name, "{}", locator.demangled_name);
         }
@@ -2676,7 +2785,7 @@ impl WindowContent for DisassemblyWindow {
             };
             let locator = FunctionLocator::load_state(inp)?;
             let title = Self::make_title(&locator.demangled_name);
-            self.tabs.push(DisassemblyTab {identity: random(), title, locator: Some(locator), error: None, area_state: AreaState::load_state(inp)?, selected_subfunction_level: inp.read_u16()?, ephemeral: false, cached_function_idx: None});
+            self.tabs.push(DisassemblyTab {identity: random(), title, locator: Some(locator), error: None, area_state: AreaState::load_state(inp)?, selected_subfunction_level: inp.read_u16()?, ephemeral: false, cached_function_idx: None, raw_addr: None});
             if select_this_tab {
                 self.tabs_state.select(self.tabs.len() - 1);
             }
@@ -2762,6 +2871,9 @@ impl WindowContent for StatusWindow {
         let start = ui.text.num_lines();
         match debugger.target_state {
             ProcessState::NoProcess | ProcessState::CoreDump => {ui_writeln!(ui, default_dim, "pid: none");}
+            _ if debugger.mode.is_remote() => {
+                ui_writeln!(ui, default, "remote");
+            }
             _ => {
                 ui_write!(ui, default_dim, "pid: ");
                 ui_write!(ui, default, "{}", debugger.pid);
@@ -3271,7 +3383,9 @@ impl ThreadsFilter {
         if query.is_empty() {
             return true;
         }
-        let name = debugger.threads.get(&tid).unwrap().info.resource_stats.latest.comm();
+        let t = debugger.threads.get(&tid).unwrap();
+        let comm = t.info.resource_stats.latest.comm();
+        let name = if comm.is_empty() { format!("cpu{}", t.tid) } else { comm.to_string() };
         if name.find(query).is_some() {
             return true;
         }
@@ -3368,8 +3482,8 @@ impl WindowContent for ThreadsWindow {
                 (0, true ) => threads.sort_unstable_by_key(|t| !t.idx),
                 (1, false) => threads.sort_unstable_by_key(|t|  t.tid),
                 (1, true ) => threads.sort_unstable_by_key(|t| !t.tid),
-                (2, false) => threads.sort_unstable_by_key(|t| (                  t.info.resource_stats.latest.comm() , t.idx)),
-                (2, true ) => threads.sort_unstable_by_key(|t| (std::cmp::Reverse(t.info.resource_stats.latest.comm()), t.idx)),
+                (2, false) => threads.sort_unstable_by_key(|t| {let c=t.info.resource_stats.latest.comm(); (if c.is_empty(){format!("cpu{}",t.tid)}else{c.to_string()}, t.idx)}),
+                (2, true ) => threads.sort_unstable_by_key(|t| {let c=t.info.resource_stats.latest.comm().to_string(); (std::cmp::Reverse(if c.is_empty(){format!("cpu{}",t.tid)}else{c}), t.idx)}),
                 (3, false) => threads.sort_unstable_by_key(|t| (                  t.info.resource_stats.latest.state , t.tid)),
                 (3, true ) => threads.sort_unstable_by_key(|t| (std::cmp::Reverse(t.info.resource_stats.latest.state), t.tid)),
                 (4, false) => threads.sort_unstable_by_key(|t| ( (t.info.resource_stats.cpu_percentage(debugger.context.settings.periodic_timer_ns) * 1000.0) as isize, t.idx)),
@@ -3459,7 +3573,8 @@ impl WindowContent for ThreadsWindow {
             if let Some(e) = &t.info.resource_stats.error {
                 ui_writeln!(ui, error, "{}", e);
             } else {
-                let name = t.info.resource_stats.latest.comm();
+                let comm = t.info.resource_stats.latest.comm();
+                let name = if comm.is_empty() { format!("cpu{}", t.tid) } else { comm.to_string() };
                 ui_writeln!(ui, default, "{}", name);
             }
             table.text_cell(ui);
@@ -3763,11 +3878,26 @@ impl WindowContent for StackWindow {
             if scroll_source_and_disassembly || rerequest_scroll {
                 state.should_scroll_source = Some((subframe.line.as_ref().map(|line| SourceScrollTarget {path: line.path.clone(), version: Some(line.version.clone()), line: line.line.line(), cascade: false}), !scroll_source_and_disassembly));
                 state.should_scroll_disassembly = Some((match (&frame.binary_id, &state.stack.subframes[frame.subframes.end - 1].function_idx) {
-                    (Err(e), _) => Err(e.clone()),
-                    (_, Err(e)) => Err(e.clone()),
+                    (Err(e), _) if e.is_loading() => Err(e.clone()),
+                    (Err(e), _) => {
+                        // Unmapped address (common for remote guests whose PC isn't in the ELF's
+                        // link map): still show raw disassembly from target memory at this frame.
+                        let _ = e;
+                        Ok(DisassemblyScrollTarget {
+                            binary_id: usize::MAX, function_idx: usize::MAX,
+                            static_pseudo_addr: frame.addr,
+                            subfunction_level: 0, cascade: false,
+                            raw_addr: Some(frame.addr)})
+                    }
+                    (_, Err(e)) if e.is_loading() => Err(e.clone()),
+                    (_, Err(_)) => Ok(DisassemblyScrollTarget {
+                        binary_id: usize::MAX, function_idx: usize::MAX,
+                        static_pseudo_addr: frame.addr,
+                        subfunction_level: 0, cascade: false,
+                        raw_addr: Some(frame.addr)}),
                     (&Ok(binary_id), &Ok(function_idx)) => Ok(DisassemblyScrollTarget {
                         binary_id, function_idx, static_pseudo_addr: frame.pseudo_addr.wrapping_sub(frame.addr_static_to_dynamic),
-                        subfunction_level: (frame.subframes.end - state.selected_subframe - 1) as u16, cascade: false}),
+                        subfunction_level: (frame.subframes.end - state.selected_subframe - 1) as u16, cascade: false, raw_addr: None}),
                 }, !scroll_source_and_disassembly));
             }
             self.seen = cur;
@@ -4360,7 +4490,7 @@ impl CodeWindow {
                 None => closest_idx,
             };
 
-            state.should_scroll_disassembly = Some((Ok(DisassemblyScrollTarget {binary_id: binary.id, function_idx: addrs[idx].0, static_pseudo_addr: addrs[idx].2, subfunction_level: addrs[idx].1, cascade: false}), false));
+            state.should_scroll_disassembly = Some((Ok(DisassemblyScrollTarget {binary_id: binary.id, function_idx: addrs[idx].0, static_pseudo_addr: addrs[idx].2, subfunction_level: addrs[idx].1, cascade: false, raw_addr: None}), false));
 
             break;
         }
@@ -4993,7 +5123,7 @@ impl WindowContent for BreakpointsWindow {
                                     if let Some(function_idx) = symbols.find_nearest_function(&locator.mangled_name, locator.addr) {
                                         let function = &symbols.functions[function_idx];
                                         state.should_scroll_disassembly = Some((Ok(DisassemblyScrollTarget {
-                                            binary_id: binary.id, function_idx, static_pseudo_addr: function.addr.0 + offset, subfunction_level: on.subfunction_level, cascade: true}), false));
+                                            binary_id: binary.id, function_idx, static_pseudo_addr: function.addr.0 + offset, subfunction_level: on.subfunction_level, cascade: true, raw_addr: None}), false));
                                     }
                                 }
                             }

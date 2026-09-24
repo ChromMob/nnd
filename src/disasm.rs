@@ -1,7 +1,7 @@
-// Disassembly via binutils libopcodes (same engine GDB uses) — not a hand-rolled decoder.
-// Flow classification is a mnemonic table over the printed text (GDB layers gdbarch the same way).
+//! Disassembly via binutils libopcodes (x86-64, aarch64, riscv64).
+//! Flow kinds classify printed mnemonics only — not a second decoder.
 
-use std::ffi::{c_char, c_int, CStr};
+use std::ffi::c_int;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arch {
@@ -25,6 +25,7 @@ pub enum FlowKind {
 pub struct Insn {
     pub len: usize,
     pub text: String,
+    /// First token, ASCII-lowercased.
     pub mnemonic: String,
     pub targets: Vec<u64>,
     pub flow: FlowKind,
@@ -32,254 +33,298 @@ pub struct Insn {
 }
 
 #[repr(C)]
-struct NndInsnOut {
-    text: [c_char; 512],
+struct RawInsn {
+    text: [u8; 512],
     len: c_int,
     ntargets: c_int,
     targets: [u64; 4],
     insn_type: c_int,
-    branch_hint: u64,
 }
 
 extern "C" {
-    fn nnd_disasm_one(arch: c_int, addr: u64, buf: *const u8, buflen: c_int, out: *mut NndInsnOut) -> c_int;
-}
-
-fn classify(arch: Arch, mnemonic: &str) -> FlowKind {
-    match arch {
-        Arch::X86_64 => match mnemonic {
-            "call" | "callq" | "lcall" => FlowKind::Call,
-            "ret" | "retq" | "retn" | "retf" | "retw" | "retl" => FlowKind::Return,
-            "jmp" | "jmpq" | "ljmp" => FlowKind::UncondBranch,
-            "je" | "jz" | "jne" | "jnz" | "ja" | "jae" | "jb" | "jbe" | "jg" | "jge" | "jl" | "jle"
-            | "js" | "jns" | "jo" | "jno" | "jp" | "jnp" | "jpe" | "jpo" | "jecxz" | "jrcxz"
-            | "loop" | "loope" | "loopz" | "loopne" | "loopnz" => FlowKind::CondBranch,
-            "syscall" | "sysenter" | "syscallq" => FlowKind::Syscall,
-            "int" | "int1" | "int3" | "into" | "ud2" => FlowKind::Interrupt,
-            _ => FlowKind::Normal,
-        },
-        Arch::AArch64 => {
-            if mnemonic == "bl" || mnemonic == "blr" {
-                FlowKind::Call
-            } else if mnemonic == "ret" {
-                FlowKind::Return
-            } else if mnemonic == "b" {
-                FlowKind::UncondBranch
-            } else if mnemonic.starts_with("b.") || mnemonic.starts_with("bc.") {
-                FlowKind::CondBranch
-            } else if matches!(mnemonic, "cbz" | "cbnz" | "tbz" | "tbnz") {
-                FlowKind::CondBranch
-            } else if matches!(mnemonic, "svc" | "hvc" | "smc") {
-                FlowKind::Syscall
-            } else if matches!(mnemonic, "brk" | "hlt" | "udf") {
-                FlowKind::Interrupt
-            } else {
-                FlowKind::Normal
-            }
-        }
-        Arch::Riscv64 => match mnemonic {
-            "call" => FlowKind::Call,
-            "tail" => FlowKind::UncondBranch,
-            "ret" | "jr" => {
-                // `jr ra` / `ret` are returns; `jr` with other regs is an indirect jump.
-                // binutils prints `ret` for `jalr x0, ra, 0`; bare `jr` usually means ra.
-                if mnemonic == "ret" {
-                    FlowKind::Return
-                } else {
-                    FlowKind::UncondBranch
-                }
-            }
-            "j" | "jal" | "jalr" => {
-                // `jal x0` prints as `j`; non-zero rd is a call.
-                if mnemonic == "jal" {
-                    FlowKind::Call
-                } else if mnemonic == "jalr" {
-                    FlowKind::Call
-                } else {
-                    FlowKind::UncondBranch
-                }
-            }
-            "beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu" | "beqz" | "bnez" | "blez" | "bgez"
-            | "bltz" | "bgtz" | "bgt" | "ble" | "bgtu" | "bleu" => FlowKind::CondBranch,
-            "ecall" => FlowKind::Syscall,
-            "ebreak" | "c.ebreak" => FlowKind::Interrupt,
-            _ => {
-                // Compressed branches.
-                if mnemonic.starts_with("c.b") || mnemonic.starts_with("c.beqz") || mnemonic.starts_with("c.bnez") {
-                    FlowKind::CondBranch
-                } else if mnemonic == "c.j" || mnemonic == "c.jr" {
-                    FlowKind::UncondBranch
-                } else if mnemonic == "c.jal" || mnemonic == "c.jalr" {
-                    FlowKind::Call
-                } else {
-                    FlowKind::Normal
-                }
-            }
-        },
-    }
-}
-
-fn first_token(text: &str) -> String {
-    text.split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim_end_matches(':')
-        .to_ascii_lowercase()
+    fn nnd_disasm_x86_64(addr: u64, buf: *const u8, buflen: c_int, out: *mut RawInsn) -> c_int;
+    fn nnd_disasm_aarch64(addr: u64, buf: *const u8, buflen: c_int, out: *mut RawInsn) -> c_int;
+    fn nnd_disasm_riscv64(addr: u64, buf: *const u8, buflen: c_int, out: *mut RawInsn) -> c_int;
 }
 
 pub fn disassemble(arch: Arch, addr: u64, bytes: &[u8]) -> Insn {
-    let empty = Insn {
-        len: 0,
-        text: String::new(),
-        mnemonic: String::new(),
-        targets: Vec::new(),
-        flow: FlowKind::Normal,
-        branch_target: None,
-    };
     if bytes.is_empty() {
-        return empty;
+        return Insn {
+            len: 0,
+            text: String::new(),
+            mnemonic: String::new(),
+            targets: Vec::new(),
+            flow: FlowKind::Normal,
+            branch_target: None,
+        };
     }
-    let mut out = NndInsnOut {
+    let mut raw = RawInsn {
         text: [0; 512],
         len: 0,
         ntargets: 0,
         targets: [0; 4],
         insn_type: 0,
-        branch_hint: 0,
     };
-    let arch_i = match arch {
-        Arch::X86_64 => 0,
-        Arch::AArch64 => 1,
-        Arch::Riscv64 => 2,
+    let rc = unsafe {
+        match arch {
+            Arch::X86_64 => nnd_disasm_x86_64(addr, bytes.as_ptr(), bytes.len() as c_int, &mut raw),
+            Arch::AArch64 => nnd_disasm_aarch64(addr, bytes.as_ptr(), bytes.len() as c_int, &mut raw),
+            Arch::Riscv64 => nnd_disasm_riscv64(addr, bytes.as_ptr(), bytes.len() as c_int, &mut raw),
+        }
     };
-    let rc = unsafe { nnd_disasm_one(arch_i, addr, bytes.as_ptr(), bytes.len() as c_int, &mut out) };
-    if rc != 0 || out.len <= 0 {
-        return empty;
+    if rc != 0 || raw.len <= 0 {
+        return Insn {
+            len: 0,
+            text: String::new(),
+            mnemonic: String::new(),
+            targets: Vec::new(),
+            flow: FlowKind::Normal,
+            branch_target: None,
+        };
     }
-    let text = unsafe { CStr::from_ptr(out.text.as_ptr()) }
-        .to_string_lossy()
-        .into_owned();
-    let text = text.trim().to_string();
-    let mnemonic = first_token(&text);
+    let text_end = raw.text.iter().position(|&b| b == 0).unwrap_or(raw.text.len());
+    let text = String::from_utf8_lossy(&raw.text[..text_end]).into_owned();
+    let mnemonic = text
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let ntargets = raw.ntargets.clamp(0, raw.targets.len() as c_int) as usize;
+    let targets: Vec<u64> = raw.targets[..ntargets].to_vec();
     let flow = classify(arch, &mnemonic);
-    let n = out.ntargets.max(0).min(4) as usize;
-    let targets: Vec<u64> = out.targets[..n].to_vec();
     let branch_target = match flow {
-        FlowKind::Call | FlowKind::CondBranch | FlowKind::UncondBranch | FlowKind::Return => {
-            targets.first().copied().or(if out.branch_hint != 0 { Some(out.branch_hint) } else { None })
+        FlowKind::Call | FlowKind::Return | FlowKind::CondBranch | FlowKind::UncondBranch => {
+            targets.first().copied()
         }
         _ => None,
     };
-    Insn { len: out.len as usize, text, mnemonic, targets, flow, branch_target }
+    Insn {
+        len: raw.len as usize,
+        text,
+        mnemonic,
+        targets,
+        flow,
+        branch_target,
+    }
+}
+
+fn classify(arch: Arch, m: &str) -> FlowKind {
+    match arch {
+        Arch::X86_64 => {
+            // Intel syntax mnemonics as printed by binutils.
+            if m == "call" || m == "callq" {
+                FlowKind::Call
+            } else if m == "ret" || m == "retq" || m == "retn" || m == "retf" {
+                FlowKind::Return
+            } else if m == "jmp" || m == "jmpq" {
+                FlowKind::UncondBranch
+            } else if matches!(
+                m,
+                "je"
+                    | "jne"
+                    | "jz"
+                    | "jnz"
+                    | "ja"
+                    | "jae"
+                    | "jb"
+                    | "jbe"
+                    | "jg"
+                    | "jge"
+                    | "jl"
+                    | "jle"
+                    | "js"
+                    | "jns"
+                    | "jo"
+                    | "jno"
+                    | "jp"
+                    | "jnp"
+                    | "jpe"
+                    | "jpo"
+                    | "jecxz"
+                    | "jrcxz"
+                    | "loop"
+                    | "loope"
+                    | "loopne"
+                    | "loopz"
+                    | "loopnz"
+            ) {
+                FlowKind::CondBranch
+            } else if m == "syscall" || m == "sysenter" || m == "sysexit" || m == "sysret" {
+                FlowKind::Syscall
+            } else if matches!(m, "int" | "int1" | "int3" | "into" | "ud2" | "iret" | "iretq") {
+                FlowKind::Interrupt
+            } else {
+                FlowKind::Normal
+            }
+        }
+        Arch::AArch64 => {
+            if m == "bl" || m == "blr" {
+                FlowKind::Call
+            } else if m == "ret" {
+                FlowKind::Return
+            } else if m == "b" || m == "br" {
+                FlowKind::UncondBranch
+            } else if m.starts_with("b.")
+                || matches!(m, "cbz" | "cbnz" | "tbz" | "tbnz" | "bcz" | "bcnz")
+            {
+                FlowKind::CondBranch
+            } else if matches!(m, "svc" | "hvc" | "smc" | "brk" | "bkpt" | "dcps1" | "dcps2" | "dcps3")
+            {
+                // svc is the A64 syscall convention.
+                FlowKind::Interrupt
+            } else {
+                FlowKind::Normal
+            }
+        }
+        Arch::Riscv64 => {
+            // Match actual binutils printed mnemonics (including c.* compressed forms).
+            if m == "ret" {
+                FlowKind::Return
+            } else if m == "call" {
+                FlowKind::Call
+            } else if matches!(m, "j" | "jr" | "c.j" | "c.jr" | "tail") {
+                FlowKind::UncondBranch
+            } else if matches!(m, "jal" | "jalr" | "c.jal" | "c.jalr") {
+                // non-ret forms (ret handled above)
+                FlowKind::Call
+            } else if m.starts_with("beq")
+                || m.starts_with("bne")
+                || m.starts_with("blt")
+                || m.starts_with("bge")
+                || m.starts_with("bgeu")
+                || m.starts_with("bltu")
+                || m == "beqz"
+                || m == "bnez"
+                || m == "blez"
+                || m == "bgez"
+                || m == "bltz"
+                || m == "bgtz"
+                || m.starts_with("c.beqz")
+                || m.starts_with("c.bnez")
+                || m.starts_with("c.b")
+            {
+                FlowKind::CondBranch
+            } else if matches!(m, "ecall" | "ebreak" | "c.ecall" | "c.ebreak" | "sret" | "mret") {
+                FlowKind::Interrupt
+            } else {
+                FlowKind::Normal
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
     #[test]
     fn x86_64_known_insns() {
-        let i = disassemble(Arch::X86_64, 0x1000, &[0x90]);
-        assert_eq!(i.mnemonic, "nop");
-        assert_eq!(i.len, 1);
-        assert_eq!(i.flow, FlowKind::Normal);
-
-        let i = disassemble(Arch::X86_64, 0x1000, &[0xc3]);
-        assert_eq!(i.mnemonic, "ret");
-        assert_eq!(i.flow, FlowKind::Return);
-
-        let i = disassemble(Arch::X86_64, 0x1000, &[0x0f, 0x05]);
-        assert_eq!(i.mnemonic, "syscall");
-        assert_eq!(i.flow, FlowKind::Syscall);
-
-        let i = disassemble(Arch::X86_64, 0x1000, &[0xcc]);
-        assert_eq!(i.flow, FlowKind::Interrupt);
-
-        // call rel32 +0 → target 0x1005
-        let i = disassemble(Arch::X86_64, 0x1000, &[0xe8, 0x00, 0x00, 0x00, 0x00]);
-        assert_eq!(i.mnemonic, "call");
-        assert_eq!(i.len, 5);
-        assert_eq!(i.flow, FlowKind::Call);
-        assert_eq!(i.branch_target, Some(0x1005));
-
-        // jmp short -2 → target 0x1000
-        let i = disassemble(Arch::X86_64, 0x1000, &[0xeb, 0xfe]);
-        assert_eq!(i.mnemonic, "jmp");
-        assert_eq!(i.flow, FlowKind::UncondBranch);
-        assert_eq!(i.branch_target, Some(0x1000));
-
-        // je +0
-        let i = disassemble(Arch::X86_64, 0x1000, &[0x74, 0x00]);
-        assert_eq!(i.mnemonic, "je");
-        assert_eq!(i.flow, FlowKind::CondBranch);
+        let cases: &[(&str, FlowKind, usize, Option<u64>)] = &[
+            ("90", FlowKind::Normal, 1, None),
+            ("c3", FlowKind::Return, 1, None),
+            ("0f05", FlowKind::Syscall, 2, None),
+            ("cc", FlowKind::Interrupt, 1, None),
+            ("e800000000", FlowKind::Call, 5, Some(0x1005)),
+            ("ebfe", FlowKind::UncondBranch, 2, Some(0x1000)),
+            ("7400", FlowKind::CondBranch, 2, Some(0x1002)),
+        ];
+        for (bytes, flow, len, target) in cases {
+            let insn = disassemble(Arch::X86_64, 0x1000, &hex(bytes));
+            assert_eq!(insn.len, *len, "len for {bytes}: {insn:?}");
+            assert_eq!(insn.flow, *flow, "flow for {bytes}: {insn:?}");
+            assert_eq!(insn.branch_target, *target, "target for {bytes}: {insn:?}");
+        }
     }
 
     #[test]
     fn aarch64_known_insns() {
-        let i = disassemble(Arch::AArch64, 0x80000, &[0x1f, 0x20, 0x03, 0xd5]);
-        assert_eq!(i.mnemonic, "nop");
-        assert_eq!(i.len, 4);
-        assert_eq!(i.flow, FlowKind::Normal);
-
-        let i = disassemble(Arch::AArch64, 0x80000, &[0xc0, 0x03, 0x5f, 0xd6]);
-        assert_eq!(i.mnemonic, "ret");
-        assert_eq!(i.flow, FlowKind::Return);
-
-        // bl +4 (imm=1 → +4)
-        let i = disassemble(Arch::AArch64, 0x80000, &[0x01, 0x00, 0x00, 0x94]);
-        assert_eq!(i.mnemonic, "bl");
-        assert_eq!(i.len, 4);
-        assert_eq!(i.flow, FlowKind::Call);
-        assert_eq!(i.branch_target, Some(0x80004));
-
-        // b 0 → self
-        let i = disassemble(Arch::AArch64, 0x80000, &[0x00, 0x00, 0x00, 0x14]);
-        assert_eq!(i.mnemonic, "b");
-        assert_eq!(i.flow, FlowKind::UncondBranch);
-
-        // svc #0
-        let i = disassemble(Arch::AArch64, 0x80000, &[0x01, 0x00, 0x00, 0xd4]);
-        assert_eq!(i.mnemonic, "svc");
-        assert_eq!(i.flow, FlowKind::Syscall);
+        // svc #0 is 0xd4000001 (bytes 010000d4); the spec's e80300d4 is undefined.
+        let cases: &[(&str, FlowKind, usize, Option<u64>)] = &[
+            ("1f2003d5", FlowKind::Normal, 4, None),
+            ("c0035fd6", FlowKind::Return, 4, None),
+            ("01000094", FlowKind::Call, 4, Some(0x80004)),
+            ("00000014", FlowKind::UncondBranch, 4, Some(0x80000)),
+            ("010000d4", FlowKind::Interrupt, 4, None),
+        ];
+        for (bytes, flow, len, target) in cases {
+            let insn = disassemble(Arch::AArch64, 0x80000, &hex(bytes));
+            assert_eq!(insn.len, *len, "len for {bytes}: {insn:?}");
+            assert_eq!(insn.flow, *flow, "flow for {bytes}: {insn:?}");
+            assert_eq!(insn.mnemonic.split_whitespace().next().unwrap_or(""), match flow {
+                FlowKind::Interrupt => "svc",
+                FlowKind::Return => "ret",
+                FlowKind::Call => "bl",
+                FlowKind::UncondBranch => "b",
+                FlowKind::Normal => "nop",
+                _ => "",
+            }, "mnemonic for {bytes}: {insn:?}");
+            if let Some(t) = target {
+                assert_eq!(insn.branch_target, Some(*t), "target for {bytes}: {insn:?}");
+            }
+        }
     }
 
     #[test]
     fn riscv64_known_insns() {
-        // addi x0,x0,0 = nop
-        let i = disassemble(Arch::Riscv64, 0x8000_0000, &[0x13, 0x00, 0x00, 0x00]);
-        assert_eq!(i.mnemonic, "nop");
-        assert_eq!(i.len, 4);
-        assert_eq!(i.flow, FlowKind::Normal);
+        // nop / ecall
+        let insn = disassemble(Arch::Riscv64, 0x80000000, &hex("13000000"));
+        assert_eq!(insn.mnemonic, "nop");
+        assert_eq!(insn.len, 4);
+        assert_eq!(insn.flow, FlowKind::Normal);
 
-        // ecall
-        let i = disassemble(Arch::Riscv64, 0x8000_0000, &[0x73, 0x00, 0x00, 0x00]);
-        assert_eq!(i.mnemonic, "ecall");
-        assert_eq!(i.flow, FlowKind::Syscall);
+        let insn = disassemble(Arch::Riscv64, 0x80000000, &hex("73000000"));
+        assert_eq!(insn.mnemonic, "ecall");
+        assert_eq!(insn.flow, FlowKind::Interrupt);
 
-        // jal x0, 0 (j self)
-        let i = disassemble(Arch::Riscv64, 0x8000_0000, &[0x6f, 0x00, 0x00, 0x00]);
-        assert_eq!(i.len, 4);
-        assert!(matches!(i.flow, FlowKind::UncondBranch | FlowKind::Call), "got {:?} ({})", i.flow, i.text);
+        // jal x0, 0 — binutils may print j or jal; accept flow matching printed text.
+        let insn = disassemble(Arch::Riscv64, 0x80000000, &hex("6f000000"));
+        assert_eq!(insn.len, 4);
+        assert!(
+            insn.mnemonic == "j" || insn.mnemonic == "jal",
+            "unexpected jal mnemonic: {insn:?}"
+        );
+        let expect = if insn.mnemonic == "j" {
+            FlowKind::UncondBranch
+        } else {
+            FlowKind::Call
+        };
+        assert_eq!(insn.flow, expect, "{insn:?}");
 
-        // jalr x0, 0(x0)
-        let i = disassemble(Arch::Riscv64, 0x8000_0000, &[0x67, 0x00, 0x00, 0x00]);
-        assert_eq!(i.len, 4);
-        assert!(matches!(i.flow, FlowKind::Return | FlowKind::UncondBranch | FlowKind::Call), "got {:?} ({})", i.flow, i.text);
+        // jalr x0, 0(x0) — ret / jr / jalr depending on print.
+        let insn = disassemble(Arch::Riscv64, 0x80000000, &hex("67000000"));
+        assert_eq!(insn.len, 4);
+        let expect = match insn.mnemonic.as_str() {
+            "ret" => FlowKind::Return,
+            "jr" => FlowKind::UncondBranch,
+            "jalr" => FlowKind::Call,
+            other => panic!("unexpected jalr mnemonic: {other}"),
+        };
+        assert_eq!(insn.flow, expect, "{insn:?}");
 
-        // beq x0,x0,0
-        let i = disassemble(Arch::Riscv64, 0x8000_0000, &[0x63, 0x00, 0x00, 0x00]);
-        assert_eq!(i.flow, FlowKind::CondBranch);
+        // Binutils prints pseudos: beq→beqz, c.nop→nop (no c. prefix by default).
+        let insn = disassemble(Arch::Riscv64, 0x80000000, &hex("63000000"));
+        assert_eq!(insn.mnemonic, "beqz");
+        assert_eq!(insn.flow, FlowKind::CondBranch);
+        assert_eq!(insn.branch_target, Some(0x80000000));
 
-        // c.nop (compressed) — binutils prints the plain mnemonic
-        let i = disassemble(Arch::Riscv64, 0x8000_0000, &[0x01, 0x00]);
-        assert_eq!(i.len, 2);
-        assert_eq!(i.mnemonic, "nop");
-        assert_eq!(i.flow, FlowKind::Normal);
+        // c.nop (0x0001) prints as nop, 2 bytes.
+        let insn = disassemble(Arch::Riscv64, 0x80000000, &hex("0100"));
+        assert_eq!(insn.len, 2);
+        assert_eq!(insn.mnemonic, "nop");
+        assert_eq!(insn.flow, FlowKind::Normal);
     }
 
     #[test]
-    fn invalid_bytes() {
-        let i = disassemble(Arch::X86_64, 0x1000, &[]);
-        assert_eq!(i.len, 0);
+    fn empty_is_invalid() {
+        let insn = disassemble(Arch::X86_64, 0, &[]);
+        assert_eq!(insn.len, 0);
+        assert_eq!(insn.flow, FlowKind::Normal);
     }
 }

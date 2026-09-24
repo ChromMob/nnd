@@ -124,7 +124,7 @@ impl Disassembly {
     }
 }
 
-pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Range<usize>>, symbols: Option<&Symbols>, code: Option<&[u8]>, intro: StyledText, palette: &Palette) -> Disassembly {
+pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Range<usize>>, symbols: Option<&Symbols>, code: Option<&[u8]>, intro: StyledText, palette: &Palette, arch: Arch) -> Disassembly {
     clean_up_ranges(&mut static_addr_ranges);
 
     let mut res = Disassembly {text: intro, lines: Vec::new(), error: None, max_abs_relative_addr: 0, indent_width: str_width(&palette.tree_indent.0), widest_line: 0, symbols_shard: None};
@@ -167,7 +167,7 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
             res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Separator, static_addr: static_addr_range.start, ..Default::default()});
         }
 
-        let arch = symbols.map(|s| s.elves[0].arch()).unwrap_or(Arch::X86_64);
+        // arch comes from the caller (binary ELF or raw fallback).
         let mut code_pos = 0usize;
         let mut ip = static_addr_range.start as u64;
 

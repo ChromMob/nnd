@@ -29,6 +29,9 @@ pub struct ThreadInfo {
     pub stack: Option<StackTrace>,
 
     pub resource_stats: ResourceStats,
+
+    // Remote stub only: GDB-register names + values from the g packet (pc, sp, ra, ...).
+    pub remote_gregs: Option<Vec<(String, u64)>>,
 }
 
 #[derive(Default)]
@@ -135,6 +138,7 @@ impl ThreadInfo {
         }
         self.partial_stack = None;
         self.stack = None;
+        // Keep remote_gregs: they refresh with registers, not with drop_caches of stacks.
     }
 }
 
@@ -422,6 +426,8 @@ pub fn refresh_all_resource_stats(pid: pid_t, my_stats: &mut ResourceStats, debu
     my_stats.update(ProcStat::parse("/proc/self/stat", prof), now, false, settings.periodic_timer_ns);
     let mut any_error = my_stats.error.clone();
 
+    // pid 0: core dump or remote stub (remote tids are not host pids — reading /proc would show
+    // unrelated host processes like pid 1 = systemd).
     if pid != 0 {
         if !threads.is_empty() {
             debuggee_stats.update(ProcStat::parse(&format!("/proc/{}/stat", pid), prof), now, false, settings.periodic_timer_ns);

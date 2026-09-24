@@ -595,6 +595,8 @@ pub struct EvalContext<'a> {
 
     pub extra_regs: Option<&'a LazyExtraRegisters>,
     pub fs_base: Option<u64>, // same as FsBase register in `stack`, but present even if `stack` is empty (when program is running)
+    // Remote stub: (name, value) pairs from target.xml g-packet; overrides the x86-shaped register list when present.
+    pub remote_gregs: Option<&'a [(String, u64)]>,
 }
 impl EvalContext<'_> {
     pub fn check_has_stack(&self) -> Result<()> {
