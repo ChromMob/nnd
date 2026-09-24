@@ -529,7 +529,10 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
     // 3 is "Shared object", and some executables use it.
     if !is_core_dump && header.e_type != 2 && header.e_type != 3 { return err!(UnsupportedExecutable, "unexpected or unsupported species of elf: e_type = {}", header.e_type); }
 
-    if header.e_machine != 0x3e { return err!(UnsupportedExecutable, "only AMD x86-64 executables are supported, for now (got: e_machine = {})", header.e_machine); }
+    // EM_X86_64=62, EM_AARCH64=183, EM_RISCV=243
+    if !matches!(header.e_machine, 0x3e | 183 | 243) {
+        return err!(UnsupportedExecutable, "only x86-64, aarch64, and riscv64 executables are supported (got: e_machine = {})", header.e_machine);
+    }
 
     if header.e_version != 1 { return err!(MalformedExecutable, "invalid e_version: {}", header.e_version); }
 

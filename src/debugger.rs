@@ -619,13 +619,23 @@ impl Debugger {
         let mut conn = GdbRemote::connect(addr).map_err(|e| Error::new(ErrorCode::Network, format!("couldn't connect to {}: {}", addr, e)))?;
         conn.handshake().map_err(|e| Error::new(ErrorCode::Network, format!("gdb handshake with {}: {}", addr, e)))?;
         let mut xml = conn.fetch_target_xml().unwrap_or_default();
-        // QEMU's target.xml often only has <architecture> + xi:include; pull the included file for registers.
-        if !xml.contains("<reg ") {
-            if let Some(href) = extract_xi_include(&xml) {
+        // QEMU often puts registers in xi:include'd files; fetch all of them (one level).
+        for _ in 0..8 {
+            if xml.contains("<reg ") {
+                break;
+            }
+            let mut found = false;
+            for href in extract_all_xi_includes(&xml) {
                 if let Ok(extra) = conn.fetch_qxfer(&href) {
-                    xml.push('\n');
-                    xml.push_str(&extra);
+                    if extra.contains("<reg ") || !extra.is_empty() {
+                        xml.push('\n');
+                        xml.push_str(&extra);
+                        found = true;
+                    }
                 }
+            }
+            if !found {
+                break;
             }
         }
         let mut remote_regs = parse_target_xml_regs(&xml);
@@ -3745,12 +3755,27 @@ pub fn parse_target_xml_regs(xml: &str) -> Vec<(String, u32, u64)> {
 
 /// Extract first `xi:include href="..."` from a target description.
 pub fn extract_xi_include(xml: &str) -> Option<String> {
-    let pos = xml.find("xi:include")?;
-    let after = &xml[pos..];
-    let href = after.find("href=\"")?;
-    let s = &after[href + 6..];
-    let end = s.find('"')?;
-    Some(s[..end].to_string())
+    extract_all_xi_includes(xml).into_iter().next()
+}
+
+/// Extract every `xi:include href="..."` from a target description.
+pub fn extract_all_xi_includes(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(pos) = rest.find("xi:include") {
+        let after = &rest[pos..];
+        rest = &after["xi:include".len()..];
+        if let Some(href) = after.find("href=\"") {
+            let s = &after[href + 6..];
+            if let Some(end) = s.find('"') {
+                let h = s[..end].to_string();
+                if !out.contains(&h) {
+                    out.push(h);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Standard GDB i386:x86-64 `g` packet layout when target.xml has no `<reg>` tags.
@@ -3788,7 +3813,8 @@ pub fn registers_from_gdb(layout: &[(String, u32, u64)], raw: &[u8]) -> Register
             val |= (raw[offset + i] as u64) << (8 * i);
         }
         offset += nbytes;
-        // Map GDB names to nnd RegisterIdx (x86-64).
+        // Map GDB names to nnd RegisterIdx. x86-64 names plus generic aliases
+        // used by aarch64/riscv target descriptions (mapped onto the fat x86-shaped slot for now).
         let idx = match name.as_str() {
             "rax" => Some(RegisterIdx::Rax),
             "rdx" => Some(RegisterIdx::Rdx),
@@ -3813,8 +3839,11 @@ pub fn registers_from_gdb(layout: &[(String, u32, u64)], raw: &[u8]) -> Register
             "gs" => Some(RegisterIdx::Gs),
             "fs_base" => Some(RegisterIdx::FsBase),
             "gs_base" => Some(RegisterIdx::GsBase),
-            "eflags" | "flags" => Some(RegisterIdx::Flags),
+            "eflags" | "flags" | "cpsr" | "sstatus" => Some(RegisterIdx::Flags),
             "orig_rax" => Some(RegisterIdx::OrigRax),
+            // aarch64 x29/x30 ≈ FP/LR; store in Rbp/Rip-adjacent slots used by UI.
+            "x29" => Some(RegisterIdx::Rbp),
+            "x30" => Some(RegisterIdx::Ret),
             _ => None,
         };
         if let Some(idx) = idx {
@@ -4014,5 +4043,180 @@ mod remote_debug {
             eprintln!("has rsp={} val={:?}", regs.has(RegisterIdx::Rsp), regs.get_option(RegisterIdx::Rsp));
         }
         let _ = child.kill(); let _ = child.wait();
+    }
+}
+
+#[cfg(test)]
+mod remote_multiarch {
+    use super::*;
+    use std::net::TcpListener;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn wait_port(port: u16, ms: u64) -> bool {
+        let start = Instant::now();
+        while start.elapsed().as_millis() < ms as u128 {
+            if TcpListener::bind(("127.0.0.1", port)).is_err() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
+    }
+
+    fn smoke(emu: &str, machine_args: &[&str]) {
+        if Command::new(emu).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| !s.success()).unwrap_or(true) {
+            eprintln!("skipping: {} not available", emu);
+            return;
+        }
+        let port = free_port();
+        let mut child = Command::new(emu)
+            .arg("-S")
+            .arg("-display").arg("none")
+            .arg("-monitor").arg("none")
+            .args(machine_args)
+            .arg("-gdb")
+            .arg(format!("tcp:127.0.0.1:{}", port))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn {}: {}", emu, e));
+        assert!(wait_port(port, 5000), "{} did not open gdb port", emu);
+
+        let settings = Settings::default();
+        let supp = SymbolsRegistry::open_supplementary_binaries(&settings).unwrap();
+        let mut dbg = Debugger::connect_remote(&format!("127.0.0.1:{}", port), &[], Context::invalid(), PersistentState::default(), supp)
+            .unwrap_or_else(|e| { let _ = child.kill(); panic!("connect {}: {}", emu, e) });
+        assert_eq!(dbg.mode, RunMode::Remote);
+        let tid = dbg.any_live_tid;
+        dbg.refresh_remote_thread(tid);
+        let pc_slot = dbg.threads[&tid].info.regs.has(RegisterIdx::Rip);
+        let pc = dbg.threads[&tid].info.regs.get_option(RegisterIdx::Rip).map(|(v, _)| v).unwrap_or(0);
+        eprintln!("{} PC = {:#x} (decoded={})", emu, pc, pc_slot);
+        // aarch64 virt at -S reports PC=0 until the first instruction; only require the slot decoded.
+        assert!(pc_slot, "{}: PC register not decoded from target.xml", emu);
+
+        let mut b = [0u8; 8];
+        let mem_ok = dbg.memory.read((if pc == 0 { 0x4000_0000 } else { pc }) as usize, &mut b).is_ok();
+        eprintln!("{} mem read ok={}", emu, mem_ok);
+
+        // Z0 at PC, continue, expect stop (or at least a clean resume path).
+        // Breakpoint at a plausible code address for this machine (reset vector-ish).
+        let bp_addr = if pc != 0 { pc as usize } else if emu.contains("aarch64") { 0x4000_0000 } else { 0x1000 };
+        let id = dbg.add_breakpoint(BreakpointOn::Instruction(InstructionBreakpoint {
+            function: None,
+            addr: bp_addr,
+            subfunction_level: 0,
+        })).expect("add bp");
+        dbg.activate_breakpoints(vec![id]).expect("activate");
+        dbg.resume().expect("resume");
+        let mut stopped = false;
+        for _ in 0..40 {
+            let _ = dbg.process_events();
+            if dbg.target_state == ProcessState::Suspended {
+                stopped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        eprintln!("{} stopped={}", emu, stopped);
+        // Not asserting stopped for non-x86: reset vector/ROM quirks; x86 e2e covers the hit path.
+        dbg.shutdown();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn qemu_aarch64_remote_smoke() {
+        smoke("qemu-system-aarch64", &["-machine", "virt", "-cpu", "cortex-a57"]);
+    }
+
+    #[test]
+    fn qemu_riscv64_remote_smoke() {
+        smoke("qemu-system-riscv64", &["-machine", "virt", "-bios", "none"]);
+    }
+}
+
+#[cfg(test)]
+mod remote_xml_fixtures {
+    use super::*;
+
+    #[test]
+    fn parse_x86_64_feature_regs() {
+        let xml = r#"<target><architecture>i386:x86-64</architecture>
+<feature name="org.gnu.gdb.i386.core">
+<reg name="rax" bitsize="64"/>
+<reg name="rbx" bitsize="64"/>
+<reg name="rip" bitsize="64" regnum="16"/>
+</feature></target>"#;
+        let layout = parse_target_xml_regs(xml);
+        assert_eq!(layout.len(), 3);
+        assert_eq!(layout[0].0, "rax");
+        assert_eq!(layout[2].0, "rip");
+        assert_eq!(layout[2].2, 16);
+        // g packet: rax=1, rbx=2, rip=0x1000 (gap regnum 16 means we still sort; offsets only walk listed regs)
+        let mut raw = vec![0u8; 24];
+        raw[0] = 1;
+        raw[8] = 2;
+        raw[16] = 0x00;
+        raw[17] = 0x10;
+        // Walk order after sort is rax, rbx, rip — but regnum 16 skips aren't holes in our offset walk.
+        // For fixture simplicity bitsizes are equal so order is what matters.
+        let regs = registers_from_gdb(&layout, &raw);
+        assert_eq!(regs.get(RegisterIdx::Rax).unwrap().0, 1);
+        assert_eq!(regs.get(RegisterIdx::Rip).unwrap().0, 0x1000);
+    }
+
+    #[test]
+    fn parse_aarch64_and_riscv_names() {
+        let aa = r#"<reg name="x0" bitsize="64"/><reg name="sp" bitsize="64"/><reg name="pc" bitsize="64"/><reg name="cpsr" bitsize="32"/>"#;
+        let layout = parse_target_xml_regs(aa);
+        assert_eq!(layout.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["x0", "sp", "pc", "cpsr"]);
+        let mut raw = vec![0u8; 8+8+8+4];
+        raw[16..24].copy_from_slice(&0x8000_0000u64.to_le_bytes());
+        let regs = registers_from_gdb(&layout, &raw);
+        assert_eq!(regs.get(RegisterIdx::Rip).unwrap().0, 0x8000_0000);
+        assert_eq!(regs.get(RegisterIdx::Rsp).unwrap().0, 0);
+
+        let rv = r#"<reg name="x10" bitsize="64"/><reg name="sp" bitsize="64"/><reg name="pc" bitsize="64"/>"#;
+        let layout = parse_target_xml_regs(rv);
+        let mut raw = vec![0u8; 24];
+        raw[16..24].copy_from_slice(&0x1000u64.to_le_bytes());
+        let regs = registers_from_gdb(&layout, &raw);
+        assert_eq!(regs.get(RegisterIdx::Rip).unwrap().0, 0x1000);
+    }
+
+    #[test]
+    fn extract_multiple_xi_includes() {
+        let xml = r#"<target><xi:include href="arm-core.xml"/><xi:include href="aarch64-core.xml"/></target>"#;
+        assert_eq!(extract_all_xi_includes(xml), vec!["arm-core.xml", "aarch64-core.xml"]);
+    }
+
+    #[test]
+    fn elf_rejects_unknown_machine() {
+        // Minimal ELF64 header with e_machine = 0x03 (i386) must be rejected.
+        let mut hdr = vec![0u8; 64];
+        hdr[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        hdr[4] = 2; // ELFCLASS64
+        hdr[5] = 1; // ELFDATA2LSB
+        hdr[6] = 1; // EV_CURRENT
+        hdr[16] = 2; // e_type ET_EXEC
+        hdr[18] = 3; // e_machine EM_386 (low); e_machine is u16 at 18
+        hdr[19] = 0;
+        hdr[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        let dir = std::env::temp_dir();
+        let path = dir.join("nnd_test_bad_machine.elf");
+        std::fs::write(&path, &hdr).unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        let err = match ElfFile::from_file(path.display().to_string(), &f, 64) {
+            Ok(_) => panic!("expected e_machine rejection"),
+            Err(e) => e,
+        };
+        assert!(err.message.contains("x86-64, aarch64, and riscv64"), "got: {}", err.message);
+        let _ = std::fs::remove_file(&path);
     }
 }
