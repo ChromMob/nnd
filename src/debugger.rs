@@ -183,6 +183,8 @@ pub struct Debugger {
     pub remote: Option<Arc<Mutex<GdbRemote>>>,
     // Parsed register layout from target.xml: (name, bit size, regnum) in g-packet order.
     pub remote_regs: Vec<(String, u32, u64)>,
+    // Guest ISA for remote/disasm when the PC has no mapped ELF (target.xml or first user ELF).
+    pub guest_arch: crate::disasm::Arch,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
@@ -470,7 +472,7 @@ impl Debugger {
             assert!(breakpoints.iter().filter(|(_, b)| b.hidden).count() == 1);
         }
 
-        Debugger {mode, command_line, pty: None, tty_size, context, pid: 0, any_live_tid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::Invalid, waiting_for_initial_sigstop: false, initial_exec_failed: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint::default()), persistent, start_count: 0, remote: None, remote_regs: Vec::new()}
+        Debugger {mode, command_line, pty: None, tty_size, context, pid: 0, any_live_tid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::Invalid, waiting_for_initial_sigstop: false, initial_exec_failed: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint::default()), persistent, start_count: 0, remote: None, remote_regs: Vec::new(), guest_arch: crate::disasm::Arch::X86_64}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -646,6 +648,11 @@ impl Debugger {
 
         let mut r = Self::new(RunMode::Remote, Vec::new(), [0, 0], context.clone(), SymbolsRegistry::new(context, supp), Pool::new(), persistent, ResourceStats::default(), Profiling::new());
         r.remote_regs = remote_regs;
+        // Prefer the stub's <architecture>, then the first user ELF — needed when PC sits
+        // outside every PT_LOAD (bare-metal reset vectors like 0xc0000000).
+        r.guest_arch = parse_target_xml_arch(&xml)
+            .or_else(|| elf_paths.first().and_then(|p| arch_from_elf_path(p)))
+            .unwrap_or(crate::disasm::Arch::X86_64);
         let conn = Arc::new(Mutex::new(conn));
         r.remote = Some(conn.clone());
 
@@ -692,6 +699,10 @@ impl Debugger {
         let Some(conn) = self.remote.clone() else { return };
         let layout = self.remote_regs.clone();
         let mut conn = match conn.lock() { Ok(c) => c, Err(_) => return };
+        if conn.resume_in_flight() {
+            // Next stub bytes are the stop reply, not a `g` dump.
+            return;
+        }
         if conn.set_thread(tid as u64).is_err() { return; }
         let Ok(raw) = conn.read_regs_raw() else { return };
         drop(conn);
@@ -1474,7 +1485,8 @@ impl Debugger {
             .and_then(|b| b.elves.as_ref().ok())
             .and_then(|elves| elves.first())
             .map(|e| e.arch())
-            .unwrap_or(crate::disasm::Arch::X86_64)
+            // Unmapped remote PC (or no ELF): use the guest ISA, not host x86.
+            .unwrap_or(self.guest_arch)
     }
 
     fn jump_target_may_be_outside_ranges(insn: &crate::disasm::Insn, ranges: &[Range<usize>]) -> bool {
@@ -1540,7 +1552,31 @@ impl Debugger {
         //  * Out of non-inlined function - put breakpoint on return address, conditional on cfa
 
         // The top frame+subframe of the stack trace is available even without symbols and unwind information.
-        let stack = self.get_stack_trace(tid, /*partial*/ false);
+        let mut stack = self.get_stack_trace(tid, /*partial*/ false);
+        if stack.frames.is_empty() {
+            // Unwind can fail before pushing any frame (unmapped remote PC, missing CFA, …).
+            // Synthesize a one-frame stack from registers so capital-S / source-step still run.
+            let regs = self.threads.get(&tid).map(|t| t.info.regs.clone());
+            if let Some(regs) = regs {
+                if let Some((pc, _)) = regs.get_option(RegisterIdx::Rip) {
+                    let addr = pc as usize;
+                    eprintln!("info: no unwind frames at {:x}; synthesizing stack from registers", addr);
+                    stack.subframes.push(StackSubframe {
+                        frame_idx: 0,
+                        function_idx: err!(MissingSymbols, "unwind failed"),
+                        ..Default::default()
+                    });
+                    stack.frames.push(StackFrame {
+                        addr,
+                        pseudo_addr: addr,
+                        regs,
+                        subframes: 0..1,
+                        binary_id: err!(ProcessState, "address not mapped"),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
         if stack.frames.is_empty() {
             return match stack.truncated.clone() {
                 None => err!(Internal, "no stack"),
@@ -1604,9 +1640,20 @@ impl Debugger {
             breakpoint_types = vec![StepBreakpointType::AfterRet];
         } else {
             // Source-code-based step Into or Over. Require line numbers and inlined functions information from debug symbols.
-
             assert!(!by_instructions);
 
+            // No mapped binary / function for this frame (common for remote guests whose PC
+            // isn't in the provided ELF's link map): fall back to instruction-level step
+            // instead of failing with "address not mapped".
+            let top = &stack.subframes[frame.subframes.end - 1];
+            if frame.binary_id.is_err() || top.function_idx.is_err() {
+                eprintln!("info: no symbols for frame at {:x}; falling back to instruction step", frame.addr);
+                step.by_instructions = true;
+                step.internal_kind = StepKind::Into;
+                step.single_steps = true;
+                step.addr_ranges.push(frame.addr..frame.addr + 1);
+                step.keep_other_threads_suspended = false;
+            } else {
             // (Disabling stop_only_on_statements if use_line_number_with_column because the .debug_line is_stmt flag is particularly unreliable when
             //  there are multiple statements on one line. Often there are even function calls in a range of instructions not marked as statement.
             //  Alternatively, we could make stop_only_on_statements detect call instructions and consider them "statements"
@@ -1628,6 +1675,7 @@ impl Debugger {
             let symbols = binary.symbols.as_ref_clone_error()?;
             unwind = Some((binary.unwind.clone()?, binary.addr_map.clone()));
             let function = &symbols.functions[function_idx];
+
             let static_pseudo_addr = binary.addr_map.dynamic_to_static(frame.pseudo_addr);
             let mut static_addr_ranges: Vec<Range<usize>> = Vec::new();
 
@@ -1723,6 +1771,7 @@ impl Debugger {
             if step.internal_kind == StepKind::Into {
                 breakpoint_types.push(StepBreakpointType::Call);
             }
+            } // end symbols-available source-step path
         }
         assert!(step.addr_ranges.windows(2).all(|a| a[0].end < a[1].start));
 
@@ -1775,7 +1824,8 @@ impl Debugger {
         }
 
         let mut may_do_syscalls = false;
-        let step_arch = self.arch_for_step(self.stepping.as_ref().and_then(|s| Some(s.binary_id)));
+        // Note: `self.stepping` is still None here — use the frame we're stepping from.
+        let step_arch = self.arch_for_step(frame.binary_id.as_ref().ok().copied());
         for range in &step.addr_ranges {
             self.determine_some_step_breakpoint_locations_arch(&breakpoint_types, range.clone(), &step.addr_ranges, /*skip_first_instruction*/ false, &mut breakpoints_to_add, &mut may_do_syscalls, &mut buf, step_arch)?;
         }
@@ -1897,7 +1947,7 @@ impl Debugger {
     // Annoyingly, this sometimes needs to be re-done in the middle of a step (see comment at one of the call sites), so it's extracted into a function.
     // Only some StepBreakpointType-s are handled here, others only need to be handled when starting a step.
     fn determine_some_step_breakpoint_locations(&self, breakpoint_types: &[StepBreakpointType], addr_range: Range<usize>, all_addr_ranges: &[Range<usize>], skip_first_instruction: bool, breakpoints_to_add: &mut Vec<(StepBreakpointType, /*addr*/ usize)>, out_may_do_syscalls: &mut bool, buf: &mut Vec<u8>) -> Result<()> {
-        return self.determine_some_step_breakpoint_locations_arch(breakpoint_types, addr_range, all_addr_ranges, skip_first_instruction, breakpoints_to_add, out_may_do_syscalls, buf, crate::disasm::Arch::X86_64);
+        return self.determine_some_step_breakpoint_locations_arch(breakpoint_types, addr_range, all_addr_ranges, skip_first_instruction, breakpoints_to_add, out_may_do_syscalls, buf, self.guest_arch);
     }
 
     fn determine_some_step_breakpoint_locations_arch(&self, breakpoint_types: &[StepBreakpointType], addr_range: Range<usize>, all_addr_ranges: &[Range<usize>], mut skip_first_instruction: bool, breakpoints_to_add: &mut Vec<(StepBreakpointType, /*addr*/ usize)>, out_may_do_syscalls: &mut bool, buf: &mut Vec<u8>, arch: crate::disasm::Arch) -> Result<()> {
@@ -2036,7 +2086,21 @@ impl Debugger {
                 c.cont(None)
             };
             if let Err(e) = r {
-                return Err(Error::new(ErrorCode::Network, format!("gdb remote resume: {}", e)));
+                drop(c);
+                // Dead socket (restart qemu, stolen gdbstub, …): don't leave the UI
+                // stuck on "stepping"/"running" with no way to recover.
+                self.cancel_stepping();
+                self.target_state = ProcessState::Suspended;
+                self.stopped_until_symbols_are_loaded = None;
+                for t in self.threads.values_mut() {
+                    t.state = ThreadState::Suspended;
+                }
+                let msg = match &e {
+                    GdbError::Io(io) if matches!(io.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof) =>
+                        format!("gdb stub connection lost ({}); restart qemu with -s -S, then restart nnd", io),
+                    _ => format!("gdb remote resume: {}", e),
+                };
+                return Err(Error::new(ErrorCode::Network, msg));
             }
         }
         let should_run: Vec<pid_t> = {
@@ -2233,7 +2297,7 @@ impl Debugger {
             Some(o) => o,
             None => return Ok(()) };
         let unit = symbols.find_unit(debug_info_offset)?;
-        let mut context = DwarfEvalContext {memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), extra_regs: None, frame_base: None, local_variables: &[], fs_base: frame.regs.get_option(RegisterIdx::FsBase).map(|(x, _)| x), tls_offset: &binary.tls_offset};
+        let mut context = DwarfEvalContext {memory, symbols: Some(symbols), addr_map: &binary.addr_map, arch: binary.arch(), encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), extra_regs: None, frame_base: None, local_variables: &[], fs_base: frame.regs.get_option(RegisterIdx::FsBase).map(|(x, _)| x), tls_offset: &binary.tls_offset};
         for v in symbols.local_variables_in_subfunction(root_subfunction, function.shard_idx()) {
             if !v.flags().contains(VariableFlags::FRAME_BASE) {
                 // Frame bases are always first in the list.
@@ -2521,8 +2585,8 @@ impl Debugger {
                         }
                         Err(_) => continue,
                     };
-                    let file_idx = match symbols.path_to_used_file.get(&bp.path as &Path) {
-                        Some(i) => *i,
+                    let file_idx = match symbols.find_used_file_idx(&bp.path) {
+                        Some(i) => i,
                         None => continue };
                     found_file = true;
                     let addrs = match symbols.line_to_addrs(file_idx, bp.line, true) {
@@ -2672,7 +2736,16 @@ impl Debugger {
         let addr = location.addr;
         if self.mode.is_remote() {
             let kind: u8 = if location.hardware { 1 } else { 0 };
-            let size: u64 = if location.hardware { 1 } else { 1 }; // stub chooses trap encoding from kind+arch
+            // GDB RSP: Z0 `kind`/length is arch-dependent. x86 uses 1; RISC-V/AArch64
+            // use the instruction size (2 or 4). QEMU may accept kind=1 but not arm it.
+            let size: u64 = if location.hardware {
+                1
+            } else {
+                match self.guest_arch {
+                    crate::disasm::Arch::X86_64 => 1,
+                    _ => 4,
+                }
+            };
             let conn = self.remote.clone().ok_or_else(|| error!(ProcessState, "no remote connection"))?;
             let mut c = match conn.lock() { Ok(c) => c, Err(_) => return err!(ProcessState, "remote connection poisoned") };
             c.insert_breakpoint(kind, addr as u64, size).map_err(|e| Error::new(ErrorCode::Network, format!("gdb Z{}: {}", kind, e)))?;
@@ -2734,10 +2807,21 @@ impl Debugger {
         if self.mode.is_remote() {
             let kind: u8 = if location.hardware { 1 } else { 0 };
             let addr = location.addr;
+            let size: u64 = if location.hardware {
+                1
+            } else {
+                match self.guest_arch {
+                    crate::disasm::Arch::X86_64 => 1,
+                    _ => 4,
+                }
+            };
             let conn = self.remote.clone().ok_or_else(|| error!(ProcessState, "no remote connection"))?;
             let mut c = match conn.lock() { Ok(c) => c, Err(_) => return err!(ProcessState, "remote connection poisoned") };
             // Stub may not have the bp (e.g. failed insert); ignore unsupported.
+            // Try both common lengths so a kind mismatch doesn’t leave a stuck Z0.
+            let _ = c.remove_breakpoint(kind, addr as u64, size);
             let _ = c.remove_breakpoint(kind, addr as u64, 1);
+            let _ = c.remove_breakpoint(kind, addr as u64, 4);
             drop(c);
             if location.hardware {
                 for h in &mut self.hardware_breakpoints {
@@ -3631,6 +3715,10 @@ impl Debugger {
                 t.sent_interrupt = false;
                 t.single_stepping = false;
                 t.stop_reasons.clear();
+                // Drop memoized stacks so the next get_stack_trace sees the new PC.
+                // (Native path does this on every WIFSTOPPED; remote never did → stale frames after step.)
+                t.info.partial_stack = None;
+                t.info.stack = None;
             }
             self.refresh_remote_thread(tid);
         }
@@ -3675,14 +3763,58 @@ impl Debugger {
             t.stop_count += 1;
         }
 
-        // Step complete: strip internal Step breakpoints (cancel_stepping) so Z packets don't linger.
+        // Step completion: for true single-steps (vCont;s) any stop ends the step.
+        // For range/Z-breakpoint steps, only end when handle_step_stop says so (Call/JumpOut
+        // intermediate hits must single-step past the call instead of aborting the step).
         let step_tid_done = self.stepping.as_ref().map(|s| s.tid);
         if step_tid_done == Some(tid) {
-            self.cancel_stepping();
-            if let Some(t) = self.threads.get_mut(&tid) {
-                if !matches!(t.stop_reasons.last(), Some(StopReason::Breakpoint(_))) {
-                    t.stop_reasons.push(StopReason::Step);
+            let regs = self.threads.get(&tid).map(|t| t.info.regs.clone()).unwrap_or_default();
+            let single_steps = self.stepping.as_ref().map_or(false, |s| s.single_steps);
+            let hit_user_bp = matches!(self.threads.get(&tid).and_then(|t| t.stop_reasons.last()), Some(StopReason::Breakpoint(_)));
+            // Any non-breakpoint stop during a vCont;s (or a completed range step) finishes it.
+            let step_done = if hit_user_bp {
+                true
+            } else if single_steps {
+                true
+            } else {
+                self.handle_step_stop(/*hit_step_breakpoint*/ true, /*single_stepped*/ true, &regs)
+            };
+            if step_done {
+                self.cancel_stepping();
+                if let Some(t) = self.threads.get_mut(&tid) {
+                    if !matches!(t.stop_reasons.last(), Some(StopReason::Breakpoint(_))) {
+                        t.stop_reasons.push(StopReason::Step);
+                    }
                 }
+            } else {
+                // Still mid-range-step (e.g. landed on a Call): single-step that insn then continue.
+                eprintln!("info: remote mid-step at {:x}; continuing with vCont;s", regs.get_option(RegisterIdx::Rip).map(|(v, _)| v).unwrap_or(0));
+                if let Some(t) = self.threads.get_mut(&tid) {
+                    t.single_stepping = true;
+                }
+                let conn = self.remote.clone();
+                if let Some(conn) = conn {
+                    let mut c = match conn.lock() { Ok(c) => c, Err(_) => return err!(ProcessState, "remote connection poisoned") };
+                    if let Err(e) = c.step(Some(tid as u64)) {
+                        drop(c);
+                        self.cancel_stepping();
+                        self.target_state = ProcessState::Suspended;
+                        if let Some(t) = self.threads.get_mut(&tid) {
+                            t.state = ThreadState::Suspended;
+                        }
+                        let msg = match &e {
+                            GdbError::Io(io) if matches!(io.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof) =>
+                                format!("gdb stub connection lost ({}); restart qemu with -s -S, then restart nnd", io),
+                            _ => format!("gdb remote mid-step: {}", e),
+                        };
+                        return Err(Error::new(ErrorCode::Network, msg));
+                    }
+                }
+                self.target_state = ProcessState::Stepping;
+                if let Some(t) = self.threads.get_mut(&tid) {
+                    t.state = ThreadState::Running;
+                }
+                return Ok(());
             }
         }
         self.stopping_to_handle_breakpoints = false;
@@ -3715,10 +3847,16 @@ impl Debugger {
             if let Some(conn) = self.remote.take() {
                 if let Ok(mut c) = conn.lock() {
                     // Best-effort: clear breakpoints then detach.
+                    let sz = match self.guest_arch {
+                        crate::disasm::Arch::X86_64 => 1u64,
+                        _ => 4,
+                    };
                     for location in &self.breakpoint_locations {
                         if location.active {
                             let kind: u8 = if location.hardware { 1 } else { 0 };
+                            let _ = c.remove_breakpoint(kind, location.addr as u64, if location.hardware {1} else {sz});
                             let _ = c.remove_breakpoint(kind, location.addr as u64, 1);
+                            let _ = c.remove_breakpoint(kind, location.addr as u64, 4);
                         }
                     }
                     let _ = c.detach();
@@ -3812,6 +3950,29 @@ impl Drop for Debugger {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Map a GDB target.xml `<architecture>` string onto nnd's disasm Arch.
+pub fn parse_target_xml_arch(xml: &str) -> Option<crate::disasm::Arch> {
+    let start = xml.find("<architecture>")? + "<architecture>".len();
+    let end = xml[start..].find("</architecture>")? + start;
+    let name = xml[start..end].trim();
+    if name.starts_with("riscv") {
+        Some(crate::disasm::Arch::Riscv64)
+    } else if name.starts_with("aarch64") || name.starts_with("armv") || name == "arm" {
+        Some(crate::disasm::Arch::AArch64)
+    } else if name.starts_with("i386") || name.starts_with("x86") || name.starts_with("amd64") {
+        Some(crate::disasm::Arch::X86_64)
+    } else {
+        None
+    }
+}
+
+/// Best-effort arch from an on-disk ELF (used when target.xml has no architecture tag).
+pub fn arch_from_elf_path(path: &str) -> Option<crate::disasm::Arch> {
+    let file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    ElfFile::from_file(path.to_string(), &file, len).ok().map(|e| e.arch())
 }
 
 /// Parse `<reg name bitsize>` entries from a GDB target description into g-packet layout.
@@ -3944,23 +4105,37 @@ pub fn registers_from_gdb(layout: &[(String, u32, u64)], raw: &[u8]) -> Register
             "orig_rax" => Some(RegisterIdx::OrigRax),
             // aarch64 / riscv GPRs mapped onto the fat x86-shaped slots for stack traces.
             // Names in the register window still follow REGISTER_NAMES (x86); values are usable for unwind.
-            "x0" | "a0" => Some(RegisterIdx::Rax),
-            "x1" | "ra" | "lr" => Some(RegisterIdx::Ret), // link register
-            "x2" | "a1" => Some(RegisterIdx::Rdx),
-            "x3" | "a2" => Some(RegisterIdx::Rcx),
-            "x4" | "a3" => Some(RegisterIdx::Rbx),
-            "x5" | "a4" => Some(RegisterIdx::Rsi),
-            "x6" | "a5" => Some(RegisterIdx::Rdi),
-            "x7" | "a6" => Some(RegisterIdx::R8),
-            "x8" | "a7" | "fp" | "s0" | "x29" => Some(RegisterIdx::Rbp), // FP
-            "x9" => Some(RegisterIdx::R9),
-            "x10" => Some(RegisterIdx::R10),
-            "x11" => Some(RegisterIdx::R11),
-            "x12" => Some(RegisterIdx::R12),
-            "x13" => Some(RegisterIdx::R13),
-            "x14" => Some(RegisterIdx::R14),
-            "x15" => Some(RegisterIdx::R15),
-            "x30" => Some(RegisterIdx::Ret),
+            // Keep sp/fp/ra/pc in their unwind-critical slots; never let an argument
+            // register alias overwrite them (a7 used to clobber fp -> Rbp).
+            //
+            // Ambiguous xN names (x2 is SP on riscv but a GPR on aarch64) are only
+            // mapped where both ABIs agree, or where the name is ABI-specific
+            // (ra/fp/a0-a7 are riscv; x29/x30 are aarch64).
+            "zero" | "wsp" => None, // zero register; no slot (and must not alias a real reg)
+            "ra" | "lr" | "x30" => Some(RegisterIdx::Ret),
+            "fp" | "s0" | "x29" => Some(RegisterIdx::Rbp),
+            "a0" | "x10" => Some(RegisterIdx::Rax),
+            "a1" | "x11" => Some(RegisterIdx::Rdx),
+            "a2" | "x12" => Some(RegisterIdx::Rcx),
+            "a3" | "x13" => Some(RegisterIdx::Rbx),
+            "a4" | "x14" => Some(RegisterIdx::Rsi),
+            "a5" | "x15" => Some(RegisterIdx::Rdi),
+            "a6" | "x16" => Some(RegisterIdx::R8),
+            "a7" | "x17" => Some(RegisterIdx::R9),
+            // aarch64 GPRs (riscv xN names for these are different registers; skip).
+            "x0" => Some(RegisterIdx::Rax),
+            "x1" => Some(RegisterIdx::Rdx),
+            "x3" => Some(RegisterIdx::Rcx),
+            "x4" => Some(RegisterIdx::Rbx),
+            "x5" => Some(RegisterIdx::Rsi),
+            "x6" => Some(RegisterIdx::Rdi),
+            "x7" => Some(RegisterIdx::R8),
+            "x9" => Some(RegisterIdx::R10),
+            "x18" => Some(RegisterIdx::R11),
+            "x19" => Some(RegisterIdx::R12),
+            "x20" => Some(RegisterIdx::R13),
+            "x21" => Some(RegisterIdx::R14),
+            "x22" => Some(RegisterIdx::R15),
             _ => None,
         };
         if let Some(idx) = idx {
@@ -4341,10 +4516,69 @@ mod remote_xml_fixtures {
         assert_eq!(regs.get(RegisterIdx::Rip).unwrap().0, 0x1000);
     }
 
+    /// QEMU's riscv gdbstub reports ABI names (zero, ra, sp, fp, a0-a7, pc).
+    /// fp and a7 must not collide on the same RegisterIdx — that used to leave
+    /// Rbp holding a7 instead of the frame pointer, and DWARF reg 2 (SP) was
+    /// looked up with the x86 map (as RCX).
+    #[test]
+    fn riscv_abi_names_fill_unwind_slots() {
+        let xml = r#"<reg name="zero" bitsize="64"/><reg name="ra" bitsize="64"/><reg name="sp" bitsize="64"/><reg name="fp" bitsize="64"/><reg name="a0" bitsize="64"/><reg name="a2" bitsize="64"/><reg name="a7" bitsize="64"/><reg name="pc" bitsize="64"/>"#;
+        let layout = parse_target_xml_regs(xml);
+        let mut raw = vec![0u8; 8 * 8];
+        let put = |raw: &mut Vec<u8>, i: usize, v: u64| {
+            raw[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes());
+        };
+        put(&mut raw, 1, 0x1111); // ra
+        put(&mut raw, 2, 0x2222); // sp
+        put(&mut raw, 3, 0x3333); // fp
+        put(&mut raw, 4, 0x4444); // a0
+        put(&mut raw, 5, 0x5555); // a2
+        put(&mut raw, 6, 0x6666); // a7
+        put(&mut raw, 7, 0x7777); // pc
+        let regs = registers_from_gdb(&layout, &raw);
+        assert_eq!(regs.get(RegisterIdx::Rsp).unwrap().0, 0x2222, "sp");
+        assert_eq!(regs.get(RegisterIdx::Rbp).unwrap().0, 0x3333, "fp must not be clobbered by a7");
+        assert_eq!(regs.get(RegisterIdx::Ret).unwrap().0, 0x1111, "ra");
+        assert_eq!(regs.get(RegisterIdx::Rip).unwrap().0, 0x7777, "pc");
+        assert_eq!(regs.get(RegisterIdx::R9).unwrap().0, 0x6666, "a7");
+        assert_eq!(regs.get(RegisterIdx::Rax).unwrap().0, 0x4444, "a0");
+    }
+
+    #[test]
+    fn dwarf_reg2_is_sp_on_riscv() {
+        use crate::registers::RegisterIdx as RI;
+        let rv = crate::disasm::Arch::Riscv64;
+        assert_eq!(RI::from_dwarf_arch(rv, gimli::Register(2)), Some(RI::Rsp));
+        assert_eq!(RI::from_dwarf_arch(rv, gimli::Register(8)), Some(RI::Rbp));
+        assert_eq!(RI::from_dwarf_arch(rv, gimli::Register(1)), Some(RI::Ret));
+        assert_eq!(RI::from_dwarf_arch(rv, gimli::Register(32)), Some(RI::Rip));
+        assert_eq!(RI::from_dwarf_arch(rv, gimli::Register(17)), Some(RI::R9), "a7");
+        // x86 map would say RCX for reg 2 — make sure we don't fall back to it.
+        assert_ne!(RI::from_dwarf_arch(rv, gimli::Register(2)), Some(RI::Rcx));
+        assert_eq!(RI::from_dwarf(gimli::Register(2)), Some(RI::Rcx), "x86 map unchanged");
+    }
+
     #[test]
     fn extract_multiple_xi_includes() {
         let xml = r#"<target><xi:include href="arm-core.xml"/><xi:include href="aarch64-core.xml"/></target>"#;
         assert_eq!(extract_all_xi_includes(xml), vec!["arm-core.xml", "aarch64-core.xml"]);
+    }
+
+    #[test]
+    fn parse_arch_from_target_xml() {
+        assert_eq!(
+            parse_target_xml_arch(r#"<target><architecture>riscv:rv64</architecture></target>"#),
+            Some(crate::disasm::Arch::Riscv64)
+        );
+        assert_eq!(
+            parse_target_xml_arch(r#"<target><architecture>aarch64</architecture></target>"#),
+            Some(crate::disasm::Arch::AArch64)
+        );
+        assert_eq!(
+            parse_target_xml_arch(r#"<target><architecture>i386:x86-64</architecture></target>"#),
+            Some(crate::disasm::Arch::X86_64)
+        );
+        assert_eq!(parse_target_xml_arch("<target></target>"), None);
     }
 
     #[test]
@@ -4369,5 +4603,368 @@ mod remote_xml_fixtures {
         };
         assert!(err.message.contains("x86-64, aarch64, and riscv64"), "got: {}", err.message);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Live tests against a user-started stub on 127.0.0.1:1234 (`qemu … -s -S`).
+/// Skips cleanly when nothing is listening — nnd never spawns QEMU.
+#[cfg(test)]
+mod remote_live {
+    use super::*;
+    use std::time::Duration;
+
+    const LIVE_ADDR: &str = "127.0.0.1:1234";
+    const LIVE_ELF: &str = "/home/chromydaiteq/Projects/riscv-demo/examples/BUILD/rv64ima-lp64-none/200-cplxcount.elf";
+
+    /// True if something is listening — without holding a gdbstub connection open
+    /// (QEMU's stub accepts a single client; a probe connect would race the real one).
+    fn live_available() -> bool {
+        std::net::TcpStream::connect(LIVE_ADDR)
+            .map(|s| {
+                // Drop immediately so the stub can accept connect_remote.
+                let _ = s.shutdown(std::net::Shutdown::Both);
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn live_riscv_connect_regs_mem_step() {
+        if !live_available() {
+            eprintln!("skipping: no gdbstub on {} (start qemu with -s -S)", LIVE_ADDR);
+            return;
+        }
+        if !std::path::Path::new(LIVE_ELF).exists() {
+            eprintln!("skipping: missing {}", LIVE_ELF);
+            return;
+        }
+
+        let settings = Settings::default();
+        let supp = SymbolsRegistry::open_supplementary_binaries(&settings).unwrap();
+        let mut dbg = Debugger::connect_remote(
+            LIVE_ADDR,
+            &[LIVE_ELF.to_string()],
+            Context::invalid(),
+            PersistentState::default(),
+            supp,
+        )
+        .unwrap_or_else(|e| panic!("connect_remote failed: {}", e));
+
+        assert_eq!(dbg.mode, RunMode::Remote);
+        assert_eq!(dbg.guest_arch, crate::disasm::Arch::Riscv64, "arch from target.xml/ELF");
+        let tid = dbg.any_live_tid;
+        dbg.refresh_remote_thread(tid);
+
+        // Park at _start and clear leftover Z packets so guest state from earlier
+        // sessions can't make continue/step flaky.
+        {
+            let conn = dbg.remote.clone().expect("remote conn");
+            let mut c = conn.lock().unwrap();
+            let pc_layout = dbg
+                .remote_regs
+                .iter()
+                .position(|(n, _, _)| n == "pc" || n == "rip")
+                .expect("pc in remote_regs") as u64;
+            for a in [0x0u64, 0x4, 0x10, 0x2ac] {
+                let _ = c.remove_breakpoint(0, a, 1);
+                let _ = c.remove_breakpoint(0, a, 2);
+                let _ = c.remove_breakpoint(0, a, 4);
+            }
+            c.write_reg_raw(pc_layout, &0u64.to_le_bytes())
+                .unwrap_or_else(|e| panic!("set PC to _start: {}", e));
+        }
+        dbg.refresh_remote_thread(tid);
+        let pc = dbg.threads[&tid].info.regs.get(RegisterIdx::Rip).map(|(v, _)| v).unwrap_or(0);
+        eprintln!("live PC = {:#x} guest_arch = {:?}", pc, dbg.guest_arch);
+        assert_eq!(pc, 0, "PC should be at _start after park");
+
+        let mut b = [0u8; 8];
+        dbg.memory.read(pc as usize, &mut b).expect("read mem at PC");
+        eprintln!("mem at PC = {:02x?}", b);
+
+        // Guest RAM can disagree with the ELF after leftover Z0 packets / partial
+        // writes. Restore enough of _start that we can actually reach 0x10.
+        {
+            let elf_bytes = std::fs::read(LIVE_ELF).expect("read elf");
+            let mut expect = b.to_vec();
+            if elf_bytes.len() >= 0x1000 + 32 {
+                let at = &elf_bytes[0x1000..0x1000 + 32];
+                if at[0..4] == [0x97, 0x31, 0x01, 0x00] {
+                    expect = at.to_vec();
+                }
+            }
+            let need_repair = b.len() != expect.len() || b.as_slice() != &expect[..b.len()];
+            if need_repair {
+                eprintln!("warning: guest mem at 0 = {:02x?}, repairing from ELF {:02x?}", b, expect);
+                let conn = dbg.remote.clone().expect("remote conn");
+                let mut c = conn.lock().unwrap();
+                c.write_mem(0, &expect).expect("repair mem at 0");
+                drop(c);
+                let mut b2 = [0u8; 32];
+                dbg.memory.read(0, &mut b2).expect("re-read mem at 0");
+                eprintln!("mem after repair = {:02x?}", &b2[..8]);
+                assert_eq!(&b2[..8], &expect[..8], "could not repair guest memory at 0");
+            }
+        }
+
+        // --- Breakpoint + continue first (clean reset state) ---
+        let bp_addr = 0x10usize;
+        let id = dbg
+            .add_breakpoint(BreakpointOn::Instruction(InstructionBreakpoint {
+                function: None,
+                addr: bp_addr,
+                subfunction_level: 0,
+            }))
+            .expect("add bp");
+        dbg.activate_breakpoints(vec![id]).expect("activate bp");
+        dbg.resume().expect("resume");
+        let mut hit = false;
+        for _ in 0..80 {
+            let _ = dbg.process_events();
+            if dbg.target_state == ProcessState::Suspended {
+                hit = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !hit {
+            let _ = dbg.suspend();
+            let pc_after = dbg.threads[&tid].info.regs.get(RegisterIdx::Rip).map(|(v, _)| v).unwrap_or(0);
+            panic!("did not stop after continue to {:#x} (PC now {:#x})", bp_addr, pc_after);
+        }
+        let pc_bp = dbg.threads[&tid].info.regs.get(RegisterIdx::Rip).map(|(v, _)| v).unwrap_or(0);
+        eprintln!("stopped at {:#x} (expected {:#x})", pc_bp, bp_addr);
+        assert_eq!(pc_bp as usize, bp_addr, "should stop at breakpoint");
+        let stack = dbg.get_stack_trace(tid, false);
+        eprintln!(
+            "stack at bp: {} frames, top fn err={:?}",
+            stack.frames.len(),
+            stack.subframes.last().and_then(|s| s.function_idx.as_ref().err().map(|e| e.message.clone()))
+        );
+
+        // --- Step tests (capital S + source fallback) ---
+        let pc = pc_bp;
+        let r = dbg.step(tid, 0, StepKind::Into, /*by_instructions*/ true, false);
+        eprintln!("capital S step => {:?}", r.as_ref().err().map(|e| e.to_string()));
+        assert!(r.is_ok(), "capital S on remote PC {:#x}: {}", pc, r.unwrap_err());
+        let mut stopped = false;
+        for _ in 0..40 {
+            let _ = dbg.process_events();
+            if dbg.target_state == ProcessState::Suspended {
+                stopped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(stopped, "step did not stop");
+        let pc2 = dbg.threads[&tid].info.regs.get(RegisterIdx::Rip).map(|(v, _)| v).unwrap_or(0);
+        eprintln!("PC after capital S = {:#x} (was {:#x})", pc2, pc);
+        assert_ne!(pc2, pc, "instruction step should advance PC");
+
+        let r = dbg.step(tid, 0, StepKind::Into, /*by_instructions*/ false, false);
+        eprintln!("source step => {:?}", r.as_ref().err().map(|e| e.to_string()));
+        assert!(r.is_ok(), "source step on remote PC {:#x}: {}", pc2, r.unwrap_err());
+        let mut stopped = false;
+        for _ in 0..40 {
+            let _ = dbg.process_events();
+            if dbg.target_state == ProcessState::Suspended {
+                stopped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(stopped, "source step did not stop");
+
+        let stack = dbg.get_stack_trace(tid, false);
+        assert!(!stack.frames.is_empty(), "stack empty after remote stop");
+        eprintln!(
+            "top frame after steps = {:#x} truncated={:?}",
+            stack.frames[0].addr,
+            stack.truncated.is_some()
+        );
+
+        dbg.shutdown();
+    }
+
+    /// Locals are DW_OP_breg2 X2+off (SP-relative). DWARF register numbers are
+    /// arch-specific: reg 2 is SP on riscv, not x86's RCX. If eval uses the x86
+    /// map it would read RCX+off instead of SP+off — this test plants known
+    /// floats on "the stack" and a decoy region at RCX, then checks eval.
+    #[test]
+    fn live_riscv_locals_use_sp_not_rcx() {
+        if !live_available() {
+            eprintln!("skipping: no gdbstub on {}", LIVE_ADDR);
+            return;
+        }
+        if !std::path::Path::new(LIVE_ELF).exists() {
+            eprintln!("skipping: missing {}", LIVE_ELF);
+            return;
+        }
+
+        let settings = Settings::default();
+        let supp = SymbolsRegistry::open_supplementary_binaries(&settings).unwrap();
+        // Need a real Executor — Context::invalid() has zero worker threads, so
+        // task_load_elf never runs and symbols stay at "opening ELF".
+        let context = Arc::new(Context {
+            settings: Settings::default(),
+            executor: crate::executor::Executor::new(2),
+            wake_main_thread: Arc::new(crate::util::EventFD::new()),
+        });
+        let mut dbg = Debugger::connect_remote(
+            LIVE_ADDR,
+            &[LIVE_ELF.to_string()],
+            context,
+            PersistentState::default(),
+            supp,
+        )
+        .unwrap_or_else(|e| panic!("connect_remote failed: {}", e));
+
+        let tid = dbg.any_live_tid;
+        let layout = dbg.remote_regs.clone();
+        let regnum = |name: &str| -> u64 {
+            layout
+                .iter()
+                .position(|(n, _, _)| n == name)
+                .unwrap_or_else(|| panic!("no reg {}", name)) as u64
+        };
+        let pc_reg = layout
+            .iter()
+            .position(|(n, _, _)| n == "pc" || n == "rip")
+            .expect("pc in remote_regs") as u64;
+        let sp_reg = regnum("sp");
+        let a2_reg = regnum("a2"); // riscv x12; x86-map would put DWARF reg 2 here as RCX
+
+        // Park inside main (after a,b stores, before o stores — doesn't matter,
+        // we plant memory ourselves). this guest's RAM is the ELF data segment
+        // at 0x11460..0x12c74 (noelv + -kernel 0-linked ELF).
+        const FAKE_SP: u64 = 0x11800;
+        const DECOY: u64 = 0x11c00;
+        {
+            let conn = dbg.remote.clone().expect("remote conn");
+            let mut c = conn.lock().unwrap();
+            for a in [0x0u64, 0x4, 0x10, 0x2ac, 0x304, 0x3b0] {
+                let _ = c.remove_breakpoint(0, a, 1);
+                let _ = c.remove_breakpoint(0, a, 2);
+                let _ = c.remove_breakpoint(0, a, 4);
+            }
+            c.write_reg_raw(pc_reg, &0x304u64.to_le_bytes()).expect("set PC");
+            c.write_reg_raw(sp_reg, &FAKE_SP.to_le_bytes()).expect("set SP");
+            c.write_reg_raw(a2_reg, &DECOY.to_le_bytes()).expect("set a2/RCX");
+            // Locations from DWARF (llvm-dwarfdump): a=X2+96, b=X2+88, o=X2+80.
+            let put_f32 = |c: &mut gdb_remote::GdbRemote, addr: u64, v: f32| {
+                c.write_mem(addr, &v.to_le_bytes()).expect("write f32");
+            };
+            put_f32(&mut c, FAKE_SP + 96, 1.23456789); // a.x
+            put_f32(&mut c, FAKE_SP + 100, 34.5678901); // a.y
+            put_f32(&mut c, FAKE_SP + 88, 2.3456789); // b.x
+            put_f32(&mut c, FAKE_SP + 92, 9.87654321); // b.y
+            put_f32(&mut c, FAKE_SP + 80, 3.58024679); // o.x
+            put_f32(&mut c, FAKE_SP + 84, 44.4444333); // o.y
+            // Decoy at RCX+off: same slots but different floats (would show up if
+            // eval used the x86 DWARF map and read reg 2 as RCX).
+            put_f32(&mut c, DECOY + 96, -1.0);
+            put_f32(&mut c, DECOY + 100, -2.0);
+            put_f32(&mut c, DECOY + 88, -3.0);
+            put_f32(&mut c, DECOY + 92, -4.0);
+            put_f32(&mut c, DECOY + 80, -5.0);
+            put_f32(&mut c, DECOY + 84, -6.0);
+        }
+        dbg.refresh_remote_thread(tid);
+        let sp = dbg.threads[&tid].info.regs.get(RegisterIdx::Rsp).map(|(v, _)| v).unwrap_or(0);
+        let rcx = dbg.threads[&tid].info.regs.get(RegisterIdx::Rcx).map(|(v, _)| v).unwrap_or(0);
+        eprintln!("SP={:#x} RCX(a2)={:#x} PC={:?}", sp, rcx,
+                  dbg.threads[&tid].info.regs.get_option(RegisterIdx::Rip));
+        assert_eq!(sp, FAKE_SP, "SP not loaded from target.xml name 'sp'");
+        assert_eq!(rcx, DECOY, "RCX slot not loaded from 'a2'");
+
+        // DWARF loads asynchronously; wait for it before evaluating locals.
+        // symbols.process_events() currently always returns true (the
+        // "any new messages" check is commented out in symbols_registry), so
+        // don't treat that as "drop caches" — that just churns maps/regs.
+        for i in 0..500 {
+            let _ = dbg.symbols.process_events();
+            let mut stage = String::new();
+            let mut any_loading = false;
+            for b in dbg.symbols.iter() {
+                if b.symbols_loaded() {
+                    continue;
+                }
+                any_loading = true;
+                stage = dbg.symbols.get_progress(b.id).1;
+            }
+            if !any_loading {
+                eprintln!("symbols loaded after {} polls", i);
+                break;
+            }
+            if i % 25 == 0 {
+                eprintln!("waiting for symbols ({}): {}", i, stage);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let stack = dbg.get_stack_trace(tid, false);
+        assert!(!stack.frames.is_empty(), "empty stack at PC=0x304");
+        eprintln!("stack: {} frames, top={:#x}", stack.frames.len(), stack.frames[0].addr);
+
+        let mut eval_context = dbg.make_eval_context(&stack, 0, tid);
+        let (mut dwarf_context, _fn) = eval_context
+            .make_local_dwarf_eval_context(0)
+            .unwrap_or_else(|e| panic!("make_local_dwarf_eval_context: {}", e));
+
+        let mut found: Vec<(String, u32, u32)> = Vec::new();
+        let pseudo = dwarf_context.addr_map.dynamic_to_static(stack.frames[0].pseudo_addr);
+        eprintln!("pseudo_addr={:#x} (want in main 0x2ac..0x3c8)", pseudo);
+        let locals = dwarf_context.local_variables;
+        for v in locals {
+            if !v.range().contains(&pseudo) {
+                continue;
+            }
+            let name = unsafe { v.name() }.to_string();
+            if name != "a" && name != "b" && name != "o" {
+                continue;
+            }
+            let (val, _dub) = eval_variable(&v.location, &mut dwarf_context)
+                .unwrap_or_else(|e| panic!("eval {}: {}", name, e));
+            let mut mem = [0u8; 8];
+            let addr = match &val {
+                crate::expr::AddrOrValueBlob::Addr(a) => *a,
+                crate::expr::AddrOrValueBlob::Blob(b) => {
+                    let s = b.as_slice();
+                    mem[..s.len().min(8)].copy_from_slice(&s[..s.len().min(8)]);
+                    let x = u32::from_le_bytes(mem[0..4].try_into().unwrap());
+                    let y = u32::from_le_bytes(mem[4..8].try_into().unwrap());
+                    eprintln!("{} = blob {{x: {}, y: {}}}", name, f32::from_bits(x), f32::from_bits(y));
+                    found.push((name, x, y));
+                    continue;
+                }
+            };
+            eprintln!("{} location = addr {:#x} (SP+{:#x} or RCX+{:#x}?)",
+                      name, addr, addr.wrapping_sub(FAKE_SP as usize), addr.wrapping_sub(DECOY as usize));
+            dwarf_context
+                .memory
+                .read(addr, &mut mem)
+                .unwrap_or_else(|e| panic!("read {} @ {:#x}: {}", name, addr, e));
+            let x = u32::from_le_bytes(mem[0..4].try_into().unwrap());
+            let y = u32::from_le_bytes(mem[4..8].try_into().unwrap());
+            eprintln!("{} @ {:#x} = {{x: {}, y: {}}}", name, addr, f32::from_bits(x), f32::from_bits(y));
+            found.push((name, x, y));
+        }
+
+        let bits = |f: f32| f.to_bits();
+        let expect: Vec<(&str, u32, u32)> = vec![
+            ("a", bits(1.23456789), bits(34.5678901)),
+            ("b", bits(2.3456789), bits(9.87654321)),
+            ("o", bits(3.58024679), bits(44.4444333)),
+        ];
+        assert_eq!(found.len(), 3, "expected a,b,o; got {:?}", found);
+        for (name, x, y) in &found {
+            let exp = expect.iter().find(|(n, _, _)| n == name).unwrap();
+            let fx = f32::from_bits(*x);
+            let fy = f32::from_bits(*y);
+            assert!((fx - f32::from_bits(exp.1)).abs() < 1e-5, "{}.x = {} (want {}; if -1/-3/-5 eval used RCX)", name, fx, f32::from_bits(exp.1));
+            assert!((fy - f32::from_bits(exp.2)).abs() < 1e-4, "{}.y = {} (want {}; if -2/-4/-6 eval used RCX)", name, fy, f32::from_bits(exp.2));
+        }
+
+        dbg.shutdown();
     }
 }

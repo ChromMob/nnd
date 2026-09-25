@@ -101,8 +101,10 @@ impl Decoder {
 
     /// Feed raw bytes from the socket; returns everything that completed.
     /// Handles packets split arbitrarily across feeds. Bad-checksum packets are dropped.
+    /// In no-ack mode stray '+'/'-' from the peer are swallowed.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Decoded> {
         let mut out = Vec::new();
+        let no_ack = self.no_ack;
         for &b in bytes {
             match &mut self.state {
                 State::Idle => match b {
@@ -110,8 +112,8 @@ impl Decoder {
                         self.payload.clear();
                         self.state = State::Data;
                     }
-                    b'+' => out.push(Decoded::Ack),
-                    b'-' => out.push(Decoded::Nack),
+                    b'+' if !no_ack => out.push(Decoded::Ack),
+                    b'-' if !no_ack => out.push(Decoded::Nack),
                     0x03 => out.push(Decoded::Interrupt),
                     _ => {} // stray noise between packets
                 },
@@ -200,6 +202,14 @@ mod tests {
         let mut d = Decoder::new();
         let got = d.feed(b"+-\x03");
         assert_eq!(got, vec![Decoded::Ack, Decoded::Nack, Decoded::Interrupt]);
+    }
+
+    #[test]
+    fn no_ack_swallows_ack_bytes() {
+        let mut d = Decoder::new();
+        d.set_no_ack(true);
+        let got = d.feed(b"+-$OK#9a");
+        assert_eq!(got, vec![Decoded::Packet(b"OK".to_vec())]);
     }
 
     #[test]

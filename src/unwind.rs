@@ -540,7 +540,7 @@ impl UnwindInfo {
 }
 
 fn eval_dwarf_expression_as_u64(expression: Expression<DwarfSlice>, encoding: Encoding, regs: &Registers, memory: &mut CachedMemReader, binary: &Binary, skip_final_dereference: bool) -> Result<(u64, /* dubious */ bool)> {
-    let (val, dubious) = eval_dwarf_expression(expression, &mut DwarfEvalContext {encoding, memory, symbols: None, unit: None, addr_map: &binary.addr_map, regs: Some(regs), frame_base: None, local_variables: &[], extra_regs: None, fs_base: regs.get_option(RegisterIdx::FsBase).map(|(x, _)| x), tls_offset: &binary.tls_offset})?;
+    let (val, dubious) = eval_dwarf_expression(expression, &mut DwarfEvalContext {encoding, memory, symbols: None, unit: None, addr_map: &binary.addr_map, arch: binary.arch(), regs: Some(regs), frame_base: None, local_variables: &[], extra_regs: None, fs_base: regs.get_option(RegisterIdx::FsBase).map(|(x, _)| x), tls_offset: &binary.tls_offset})?;
     let val = if skip_final_dereference {
         // I'm probably misunderstanding something, but the meaning of gimli::read::Location::Address seems to be different between CFA/frame-base vs registers/variables.
         // In CFA and frame base, we treat Location::Address the same as Location::Value, presumably because the "value" of CFA/frame-base is an "address", so no dereference is needed.
@@ -564,7 +564,7 @@ fn eval_cfa_rule(rule: &CfaRule<usize>, encoding: Encoding, section: DwarfSlice,
             eval_dwarf_expression_as_u64(e, encoding, registers, memory, binary, /*skip_final_dereference*/ true)?
         }
         CfaRule::RegisterAndOffset {register: reg, offset} => {
-            let reg = match RegisterIdx::from_dwarf(*reg) {
+            let reg = match RegisterIdx::from_dwarf_arch(binary.arch(), *reg) {
                 None => return err!(Dwarf, "unsupported register in cfa: {:?}", reg),
                 Some(r) => r,
             };
@@ -589,7 +589,7 @@ fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, enco
             }
         }
         RegisterRule::Register(reg) => {
-            let reg = match RegisterIdx::from_dwarf(*reg) {
+            let reg = match RegisterIdx::from_dwarf_arch(binary.arch(), *reg) {
                 None => return err!(NotImplemented, "unsupported register (in reg): {:?}", reg),
                 Some(r) => r,
             };

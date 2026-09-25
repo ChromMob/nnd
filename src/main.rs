@@ -560,7 +560,12 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
     // The debugger.process_events() path of this loop should be kept light, it'll likely be the bottleneck for conditional breakpoints (including thread-specific breakpoints, including temporary breakpoints when stepping).
     loop {
         let mut events: [libc::epoll_event; 32] = unsafe { mem::zeroed() };
-        let n = epoll.wait(&mut events)?;
+        // Remote gdbstub has no SIGCHLD; poll on a short timeout while the guest
+        // is running/stepping or the main thread would block forever on epoll
+        // and never read the stop reply (stuck on "stepping").
+        let poll_remote = debugger.mode.is_remote()
+            && matches!(debugger.target_state, ProcessState::Running | ProcessState::Stepping);
+        let n = epoll.wait_timeout(&mut events, if poll_remote { 50 } else { -1 })?;
         let mut render_now = false;
         let mut schedule_render = false;
         for event in &events[..n] {
@@ -610,6 +615,9 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
             schedule_render |= event_schedules_render;
         }
 
+        if poll_remote {
+            have_debugger_events = true;
+        }
         if have_debugger_events {
             let mut prof = TscScopeExcludingSyscalls::new(&debugger.prof.bucket);
             let drop_caches;

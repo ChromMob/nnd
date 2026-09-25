@@ -100,12 +100,26 @@ impl ScreenBuffer {
             return x;
         }
         let row_start = y as usize * self.width;
+        // Control chars (esp. TAB from binutils disasm) must never be written to
+        // stdout: they break the ANSI cursor stream. Replace with spaces.
+        let sanitized;
+        let text: &str = if text.chars().any(|c| c.is_control()) {
+            sanitized = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>();
+            &sanitized
+        } else {
+            text
+        };
         for s in text.graphemes(true) {
             if x >= clip.right() {
                 break;
             }
 
             let w = s.width();
+            // After sanitizing, remaining zero-width graphemes (combining marks)
+            // must not overwrite a cell — skip them.
+            if w == 0 {
+                continue;
+            }
             let start = x;
             x += w as isize;
 

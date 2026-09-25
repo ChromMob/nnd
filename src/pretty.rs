@@ -256,7 +256,7 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
                 }
                 VariableLocation::Expr(expr) => {
                     let default_encoding = gimli::Encoding {address_size: 8, format: gimli::Format::Dwarf64, version: 5};
-                    let s = match format_dwarf_expression(expr, default_encoding) {
+                    let s = match format_dwarf_expression(expr, default_encoding, crate::disasm::Arch::X86_64) {
                         Ok(s) => s,
                         Err(e) => format!("<error: {}>", e),
                     };

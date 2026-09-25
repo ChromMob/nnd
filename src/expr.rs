@@ -302,7 +302,7 @@ impl AddrOrValueBlob {
     }
 }
 
-pub fn format_dwarf_expression<'a>(expr: Expression<DwarfSlice>, encoding: Encoding) -> Result<String> {
+pub fn format_dwarf_expression<'a>(expr: Expression<DwarfSlice>, encoding: Encoding, arch: crate::disasm::Arch) -> Result<String> {
     let mut res = String::new();
     let mut op_iter = expr.operations(encoding);
     while let Some(op) = op_iter.next()? {
@@ -317,7 +317,7 @@ pub fn format_dwarf_expression<'a>(expr: Expression<DwarfSlice>, encoding: Encod
             Operation::UnsignedConstant {value} => write!(res, "{}u", value)?,
             Operation::SignedConstant {value} => write!(res, "{}s", value)?,
             Operation::RegisterOffset {register, offset, base_type} => {
-                if let Some(r) = RegisterIdx::from_dwarf(register) {
+                if let Some(r) = RegisterIdx::from_dwarf_arch(arch, register) {
                     write!(res, "{}", r)
                 } else if let Some(r) = ExtraRegisterIdx::from_dwarf(register) {
                     write!(res, "{}", r)
@@ -337,7 +337,7 @@ pub fn format_dwarf_expression<'a>(expr: Expression<DwarfSlice>, encoding: Encod
                     write!(res, "{}0x{:x}", if offset < 0 {"-"} else {"+"}, offset.abs())?;
                 }
             }
-            Operation::EntryValue {expression} => write!(res, "entry_value({})", format_dwarf_expression(Expression(expression), encoding)?)?,
+            Operation::EntryValue {expression} => write!(res, "entry_value({})", format_dwarf_expression(Expression(expression), encoding, arch)?)?,
             Operation::Address {address} => write!(res, "addr({:x})", address)?,
             Operation::AddressIndex {index} => write!(res, "debug_addr[{}]", index.0)?,
             Operation::ConstantIndex {index} => write!(res, "debug_addr(const)[{}]", index.0)?,
@@ -351,7 +351,7 @@ pub fn format_dwarf_expression<'a>(expr: Expression<DwarfSlice>, encoding: Encod
             // These specify where the result is.
             Operation::Register {register} => {
                 write!(res, "reg(")?;
-                if let Some(r) = RegisterIdx::from_dwarf(register) {
+                if let Some(r) = RegisterIdx::from_dwarf_arch(arch, register) {
                     write!(res, "{}", r)
                 } else if let Some(r) = ExtraRegisterIdx::from_dwarf(register) {
                     write!(res, "{}", r)
@@ -632,14 +632,14 @@ impl EvalContext<'_> {
         let subfunction = &symbols.shards[shard_idx].subfunctions[subfunction_idx];
         let local_variables = symbols.local_variables_in_subfunction(subfunction, shard_idx);
 
-        let context = DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, tls_offset: &binary.tls_offset, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), extra_regs: self.extra_regs.clone(), frame_base: Some(&frame.frame_base), local_variables, fs_base: self.fs_base.clone()};
+        let context = DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, tls_offset: &binary.tls_offset, arch: binary.arch(), encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), extra_regs: self.extra_regs.clone(), frame_base: Some(&frame.frame_base), local_variables, fs_base: self.fs_base.clone()};
         Ok((context, function))
     }
 
     pub fn make_global_dwarf_eval_context<'a>(&'a mut self, binary: &'a Binary, die_offset: DebugInfoOffset) -> Result<DwarfEvalContext<'a>> {
         let symbols = binary.symbols.as_ref_clone_error()?;
         let unit = symbols.find_unit(die_offset)?;
-        Ok(DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, tls_offset: &binary.tls_offset, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: None, extra_regs: None, frame_base: None, local_variables: &[], fs_base: self.fs_base.clone()})
+        Ok(DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, tls_offset: &binary.tls_offset, arch: binary.arch(), encoding: unit.unit.header.encoding(), unit: Some(unit), regs: None, extra_regs: None, frame_base: None, local_variables: &[], fs_base: self.fs_base.clone()})
     }
 }
 
@@ -1287,6 +1287,8 @@ pub struct DwarfEvalContext<'a> {
     pub symbols: Option<&'a Symbols>,
     pub addr_map: &'a AddrMap,
     pub tls_offset: &'a Result<usize>,
+    // Target architecture: DWARF register numbers are arch-specific.
+    pub arch: crate::disasm::Arch,
 
     // Unit.
     pub encoding: Encoding,
@@ -1346,7 +1348,7 @@ pub fn eval_dwarf_expression(mut expression: Expression<DwarfSlice>, context: &m
                 } else {
                     return err!(Dwarf, "can't look up base type (register) without symbols");
                 };
-                let (reg_val, dub) = if let Some(reg) = RegisterIdx::from_dwarf(*register) {
+                let (reg_val, dub) = if let Some(reg) = RegisterIdx::from_dwarf_arch(context.arch, *register) {
                     let regs = match &context.regs { Some(r) => r, None => return err!(Dwarf, "register op unexpected") };
                     regs.get(reg)?
                 } else if let Some(reg) = ExtraRegisterIdx::from_dwarf(*register) {
@@ -1457,7 +1459,7 @@ pub fn eval_dwarf_expression(mut expression: Expression<DwarfSlice>, context: &m
                 AddrOrValueBlob::Blob(ValueBlob::from_slice(b.slice()))
             }
             Location::Register{register: reg} => {
-                if let Some(reg) = RegisterIdx::from_dwarf(reg) {
+                if let Some(reg) = RegisterIdx::from_dwarf_arch(context.arch, reg) {
                     let &Some(regs) = &context.regs else {return err!(Dwarf, "register location unexpected")};
                     match regs.get(reg) {
                         Err(_) => return err!(Dwarf, "register {} optimized away", reg),

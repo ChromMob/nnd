@@ -1808,7 +1808,7 @@ impl LocationsWindow {
                         VariableLocation::Unknown => Ok("unknown".to_string()),
                         VariableLocation::Expr(expr) => {
                             match &encoding {
-                                Ok(e) => format_dwarf_expression(expr, *e),
+                                Ok(e) => format_dwarf_expression(expr, *e, binary.arch()),
                                 Err(e) => Err(e.clone())
                             }
                         }
@@ -2064,12 +2064,22 @@ impl DisassemblyWindow {
         Some((binary, function_idx))
     }
 
-    fn find_or_disassemble_raw(_cache: &mut HashMap<usize, Disassembly>, debugger: &Debugger, addr: usize, palette: &Palette) -> Result<Disassembly> {
-        // 256 bytes of memory is cheap to disassemble every frame; Disassembly isn't Clone.
-        let arch = debugger.symbols.iter()
-            .filter_map(|b| b.elves.as_ref().ok())
-            .find_map(|e| e.first().map(|elf| elf.arch()))
-            .unwrap_or(Arch::X86_64);
+    fn find_or_disassemble_raw(cache: &mut HashMap<usize, Disassembly>, debugger: &Debugger, addr: usize, palette: &Palette) -> Result<Disassembly> {
+        // Only hit the stub when stopped. While stepping/running the next packet is
+        // the stop reply — an `m` here desyncs Hg (reply stolen as hex, e.g.
+        // "Hg failed: 9300…" which is reset-vector bytes).
+        let can_read = matches!(debugger.target_state, ProcessState::Suspended | ProcessState::CoreDump)
+            && !debugger.remote.as_ref().map_or(false, |c| c.lock().map(|g| g.resume_in_flight()).unwrap_or(false));
+        if !can_read {
+            // Reuse last disassembly if we have one; otherwise a clear error (no I/O).
+            if let Some(hit) = cache.get(&addr) {
+                // Disassembly is not Clone; rebuild a placeholder error instead of I/O.
+                // Callers only need something safe to draw while the guest runs.
+                let _ = hit;
+            }
+            return Err(error!(ProcessState, "target running; disassembly paused"));
+        }
+        let arch = debugger.guest_arch;
         let mut buf = vec![0u8; 256];
         debugger.memory.read(addr, &mut buf)?;
         let mut intro = StyledText::default();
@@ -4170,6 +4180,46 @@ impl CodeWindow {
                 return Some((f, path_in_symbols.to_owned()));
             }
         }
+
+        // Build intermediates: debug info may name `count.c_S` while the readable
+        // source is `count.c` (or the reverse when the user opens the original).
+        let mut alts: Vec<PathBuf> = Vec::new();
+        if let Some(name) = path_in_symbols.file_name().and_then(|n| n.to_str()) {
+            let alt_name = if let Some(stripped) = name.strip_suffix("_S") {
+                stripped.to_owned()
+            } else {
+                format!("{}_S", name)
+            };
+            if let Some(parent) = path_in_symbols.parent() {
+                alts.push(parent.join(&alt_name));
+            }
+            // Same suffix walk as above, with the alternate basename.
+            let mut comps = components.clone();
+            if let Some(last) = comps.last_mut() {
+                if let path::Component::Normal(_) = last {
+                    *last = path::Component::Normal(std::ffi::OsStr::new(&alt_name));
+                }
+            }
+            for start in absolute as usize .. comps.len() {
+                for base in code_dirs {
+                    let mut path_to_try = base.clone();
+                    path_to_try.extend(comps[start..].iter());
+                    alts.push(path_to_try);
+                }
+            }
+            if absolute {
+                let mut joined = PathBuf::new();
+                for c in &comps {
+                    joined.push(c);
+                }
+                alts.push(joined);
+            }
+        }
+        for alt in alts {
+            if let Ok(f) = File::open(&alt) {
+                return Some((f, alt));
+            }
+        }
         None
     }
 
@@ -4406,8 +4456,8 @@ impl CodeWindow {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let file_idx = match symbols.path_to_used_file.get(&key.0 as &Path) {
-                Some(i) => *i,
+            let file_idx = match symbols.find_used_file_idx(&key.0) {
+                Some(i) => i,
                 None => continue };
             let addrs0 = match symbols.line_to_addrs(file_idx, key.2 + 1, false) {
                 Ok(x) => x,
@@ -4868,12 +4918,51 @@ struct BreakpointsWindow {
     selected_breakpoint: Option<BreakpointId>,
     condition_input: Option<(BreakpointId, TextInput)>,
     initialized: bool,
+    /// Open the "add from symbols" dialog on this frame.
+    open_add_from_symbols: bool,
+    add_cursor: usize,
+}
+impl BreakpointsWindow {
+    /// Points of interest found in loaded symbols, plus whether a breakpoint for them already exists.
+    fn add_candidates(&self, debugger: &Debugger) -> Vec<(PointOfInterest, usize, /*already*/ bool)> {
+        let mut have: HashSet<PointOfInterest> = HashSet::new();
+        for (_, bp) in debugger.breakpoints.iter() {
+            if let BreakpointOn::PointOfInterest(p) = &bp.on {
+                if !bp.hidden {
+                    have.insert(*p);
+                }
+            }
+        }
+        let mut found: Vec<(PointOfInterest, usize, bool)> = Vec::new();
+        for binary in debugger.symbols.iter() {
+            let symbols = match &binary.symbols {
+                Ok(s) if binary.is_mapped => s,
+                _ => continue,
+            };
+            for (p, addrs) in &symbols.points_of_interest {
+                if addrs.is_empty() || *p == PointOfInterest::LibraryLoad {
+                    continue;
+                }
+                let already = have.contains(p);
+                match found.iter_mut().find(|(q, _, _)| q == p) {
+                    Some(slot) => {
+                        slot.1 += addrs.len();
+                        slot.2 |= already;
+                    }
+                    None => found.push((*p, addrs.len(), already)),
+                }
+            }
+        }
+        found.sort_by_key(|(p, _, _)| *p);
+        found
+    }
 }
 impl WindowContent for BreakpointsWindow {
     fn get_key_hints(&self, out: &mut Vec<KeyHint>, debugger: &Debugger) {
         out.extend([
             KeyHint::key(KeyAction::DeleteRow, "delete breakpoint"),
             KeyHint::keys(&[KeyAction::Enter, KeyAction::EditCondition], "enable/disable/edit breakpoint"),
+            KeyHint::key(KeyAction::Open, "add breakpoint from symbols"),
             KeyHint::key(KeyAction::Tooltip, "tooltip"),
         ]);
     }
@@ -4914,9 +5003,14 @@ impl WindowContent for BreakpointsWindow {
             start_editing_condition = true;
         }
 
-        for action in ui.check_keys(&[KeyAction::DeleteRow, KeyAction::Enter, KeyAction::EditCondition, KeyAction::Cancel]) {
+        let mut open_add = mem::take(&mut self.open_add_from_symbols);
+        for action in ui.check_keys(&[KeyAction::DeleteRow, KeyAction::Enter, KeyAction::EditCondition, KeyAction::Cancel, KeyAction::Open]) {
             if action == KeyAction::Cancel {
                 self.condition_input = None;
+            }
+            if action == KeyAction::Open && self.condition_input.is_none() {
+                open_add = true;
+                continue;
             }
             let id = match &self.selected_breakpoint {
                 None => continue,
@@ -4949,6 +5043,83 @@ impl WindowContent for BreakpointsWindow {
                 if let Some(breakpoint) = debugger.breakpoints.try_get(id) {
                     let text = breakpoint.condition.as_ref().map_or(String::new(), |(s, _, _)| s.clone());
                     self.condition_input = Some((id, TextInput::new_multiline(text)));
+                }
+            }
+        }
+
+        // "o" — add a special breakpoint from points of interest found in debug symbols.
+        {
+            let candidates = self.add_candidates(debugger);
+            if self.add_cursor >= candidates.len() {
+                self.add_cursor = candidates.len().saturating_sub(1);
+            }
+            let mut added: Option<PointOfInterest> = None;
+            if let Some(dialog_widget) = make_dialog_frame(
+                open_add,
+                AutoSize::Remainder(0.55),
+                AutoSize::Remainder(0.45),
+                ui.palette.dialog,
+                ui.palette.default,
+                "add breakpoint from symbols",
+                ui,
+            ) {
+                with_parent!(ui, dialog_widget, {
+                    // Dialog content must stack; without this children don't layout.
+                    ui.cur_mut().set_vstack();
+
+                    let waiting = debugger.symbols.iter().any(|b| matches!(&b.symbols, Err(e) if e.is_loading()));
+                    if waiting {
+                        ui_writeln!(ui, warning, "waiting for symbols to load…");
+                    }
+                    if candidates.is_empty() {
+                        if !waiting {
+                            ui_writeln!(ui, default_dim, "no special breakpoints found in debug symbols");
+                            ui_writeln!(ui, default_dim, "(for ordinary functions, use find function in the disassembly window)");
+                        }
+                    } else {
+                        ui_writeln!(ui, default_dim, "points of interest from debug symbols — Enter to add");
+                        let mut dialog_table = Table::new(TableState {cursor: self.add_cursor, ..TableState::default()}, ui, vec![
+                            Column::new("", AutoSize::Remainder(1.0), false),
+                            Column::new("locs", AutoSize::Text, false),
+                            Column::new("", AutoSize::Fixed(8), false),
+                        ]);
+                        for (i, (p, n, already)) in candidates.iter().enumerate() {
+                            dialog_table.start_row(i, ui);
+                            // text_cell sets draw_text on the cell itself (AutoSize::Text columns
+                            // measure that, not a child widget — children panic on unwrap).
+                            ui_writeln!(ui, function_name, "{}", p.name_for_ui());
+                            dialog_table.text_cell(ui);
+                            ui_writeln!(ui, default_dim, "{}", n);
+                            dialog_table.text_cell(ui);
+                            if *already {
+                                ui_writeln!(ui, default_dim, "in list");
+                            } else {
+                                ui_writeln!(ui, default, " ");
+                            }
+                            dialog_table.text_cell(ui);
+                        }
+                        let finished = dialog_table.finish(ui);
+                        if finished.did_scroll_to_cursor {
+                            self.add_cursor = finished.cursor.min(candidates.len().saturating_sub(1));
+                        }
+                        for _ in ui.check_keys(&[KeyAction::Enter]) {
+                            if let Some((p, _, already)) = candidates.get(self.add_cursor) {
+                                if !already {
+                                    added = Some(*p);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            if let Some(p) = added {
+                match debugger.add_breakpoint(BreakpointOn::PointOfInterest(p)) {
+                    Ok(id) => {
+                        self.selected_breakpoint = Some(id);
+                        self.table_state.scroll_to_cursor = true;
+                        ui.close_dialog();
+                    }
+                    Err(e) => report_result(state, &Err::<BreakpointId, _>(e)),
                 }
             }
         }

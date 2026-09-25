@@ -3,6 +3,7 @@
 // parsed elsewhere (registers layer).
 
 use crate::gdbproto::{self, Decoded, Decoder};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
@@ -108,6 +109,15 @@ pub struct GdbRemote {
     /// Max payload the stub advertised (PacketSize=hex); default if unknown.
     packet_size: usize,
     qsupported: String,
+    /// Decoded events already read from the socket but not yet consumed;
+    /// a single read() can carry a reply plus an async notification.
+    pending: VecDeque<Decoded>,
+    /// Non-stop packets seen while awaiting a stop reply (kept so wait_reply can
+    /// still surface them if they were command replies).
+    orphan_replies: VecDeque<Vec<u8>>,
+    /// Set after vCont;c/s until a stop reply is read. While set, the stub's
+    /// next bytes are that stop — any Hg/m/g would steal them and desync.
+    resume_in_flight: bool,
 }
 
 impl GdbRemote {
@@ -122,60 +132,130 @@ impl GdbRemote {
             no_ack: false,
             packet_size: 0x4000,
             qsupported: String::new(),
+            pending: VecDeque::new(),
+            orphan_replies: VecDeque::new(),
+            resume_in_flight: false,
         })
+    }
+
+    /// True after vCont until the matching stop reply has been observed.
+    pub fn resume_in_flight(&self) -> bool {
+        self.resume_in_flight
     }
 
     /// Send a packet and wait for its reply. Auto-acks when in ack mode.
     pub fn send_packet(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        if self.resume_in_flight {
+            // Hitting this means the caller raced a vCont — the next reply on the
+            // wire is the stop, not the answer to this command (seen as
+            // "Hg failed: 9300…" = stolen `m`/`g` hex payload).
+            return Err(GdbError::Protocol(
+                "target is running (resume in flight); wait for stop before Hg/m/g".into(),
+            ));
+        }
         let pkt = gdbproto::encode_packet(payload);
         self.stream.write_all(&pkt)?;
         self.stream.flush()?;
         self.wait_reply()
     }
 
+    fn mark_resume_in_flight(&mut self) {
+        self.resume_in_flight = true;
+    }
+
+    fn clear_resume_if_stop(&mut self, payload: &[u8]) {
+        if !self.resume_in_flight {
+            return;
+        }
+        if payload.first().map(|&b| matches!(b, b'T' | b'S' | b'W' | b'X')).unwrap_or(false) {
+            self.resume_in_flight = false;
+        }
+    }
+
+    /// Read whatever is already queued on the socket (short timeout) into `pending`.
+    fn drain_ready(&mut self) -> Result<()> {
+        let old = self.stream.read_timeout()?;
+        self.stream.set_read_timeout(Some(Duration::from_millis(50)))?;
+        let result = loop {
+            match self.read_once() {
+                Ok(()) => continue,
+                Err(GdbError::Io(e)) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+        self.stream.set_read_timeout(old)?;
+        result
+    }
+
+    fn read_once(&mut self) -> Result<()> {
+        let mut buf = [0u8; 4096];
+        let n = self.stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(GdbError::Protocol("connection closed".into()));
+        }
+        for d in self.decoder.feed(&buf[..n]) {
+            self.pending.push_back(d);
+        }
+        Ok(())
+    }
+
+    fn next_decoded(&mut self) -> Result<Decoded> {
+        loop {
+            if let Some(d) = self.pending.pop_front() {
+                return Ok(d);
+            }
+            self.read_once()?;
+        }
+    }
+
+    fn ack_packet(&mut self) -> Result<()> {
+        if !self.no_ack {
+            self.stream.write_all(b"+")?;
+            self.stream.flush()?;
+        }
+        Ok(())
+    }
+
     /// Read until a data packet arrives (skipping Acks/Nacks/Interrupts).
     fn wait_reply(&mut self) -> Result<Vec<u8>> {
-        let mut buf = [0u8; 4096];
+        // Prefer packets stashed while a previous resume was in flight.
+        if let Some(p) = self.orphan_replies.pop_front() {
+            return Ok(p);
+        }
         loop {
-            let n = self.stream.read(&mut buf)?;
-            if n == 0 {
-                return Err(GdbError::Protocol("connection closed".into()));
-            }
-            for d in self.decoder.feed(&buf[..n]) {
-                match d {
-                    Decoded::Packet(p) => {
-                        if !self.no_ack {
-                            self.stream.write_all(b"+")?;
-                            self.stream.flush()?;
-                        }
-                        return Ok(p);
-                    }
-                    Decoded::Ack | Decoded::Nack => {}
-                    Decoded::Interrupt => {}
+            match self.next_decoded()? {
+                Decoded::Packet(p) => {
+                    self.ack_packet()?;
+                    return Ok(p);
                 }
+                Decoded::Ack | Decoded::Nack | Decoded::Interrupt => {}
             }
         }
     }
 
     /// Non-blocking-ish: short read timeout, returns Ok(None) if nothing arrived.
     pub fn poll_packet(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
+        loop {
+            match self.pending.pop_front() {
+                Some(Decoded::Packet(p)) => return Ok(Some(p)),
+                Some(_) => continue,
+                None => break,
+            }
+        }
         let old = self.stream.read_timeout()?;
         self.stream.set_read_timeout(Some(timeout))?;
         let result = (|| -> Result<Option<Vec<u8>>> {
-            let mut buf = [0u8; 4096];
-            match self.stream.read(&mut buf) {
-                Ok(0) => Err(GdbError::Protocol("connection closed".into())),
-                Ok(n) => {
-                    for d in self.decoder.feed(&buf[..n]) {
-                        match d {
-                            Decoded::Packet(p) => return Ok(Some(p)),
-                            Decoded::Ack | Decoded::Nack | Decoded::Interrupt => {}
+            match self.read_once() {
+                Ok(()) => {
+                    while let Some(d) = self.pending.pop_front() {
+                        if let Decoded::Packet(p) = d {
+                            return Ok(Some(p));
                         }
                     }
                     Ok(None)
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => Ok(None),
-                Err(e) => Err(GdbError::Io(e)),
+                Err(GdbError::Io(e)) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => Ok(None),
+                Err(e) => Err(e),
             }
         })();
         self.stream.set_read_timeout(old)?;
@@ -183,6 +263,8 @@ impl GdbRemote {
     }
 
     pub fn handshake(&mut self) -> Result<()> {
+        // Some stubs emit an unsolicited stop reply before the first request; keep it for wait_stop.
+        self.drain_ready()?;
         let reply = self.send_packet(b"qSupported:swbreak+;hwbreak+;qXfer:features:read+;QStartNoAckMode+")?;
         self.qsupported = String::from_utf8_lossy(&reply).into_owned();
         if let Some(sz) = parse_packet_size(&self.qsupported) {
@@ -346,6 +428,7 @@ impl GdbRemote {
         let frame = gdbproto::encode_packet(pkt.as_bytes());
         self.stream.write_all(&frame)?;
         self.stream.flush()?;
+        self.mark_resume_in_flight();
         Ok(())
     }
 
@@ -357,6 +440,7 @@ impl GdbRemote {
         let frame = gdbproto::encode_packet(pkt.as_bytes());
         self.stream.write_all(&frame)?;
         self.stream.flush()?;
+        self.mark_resume_in_flight();
         Ok(())
     }
 
@@ -392,49 +476,56 @@ impl GdbRemote {
 
     /// Block (with read timeout) until a stop-reply packet arrives.
     pub fn wait_stop(&mut self) -> Result<StopInfo> {
-        let mut buf = [0u8; 4096];
         loop {
-            let n = self.stream.read(&mut buf)?;
-            if n == 0 {
-                return Err(GdbError::Protocol("connection closed while waiting for stop".into()));
-            }
-            for d in self.decoder.feed(&buf[..n]) {
-                match d {
-                    Decoded::Packet(p) => {
-                        if !self.no_ack {
-                            self.stream.write_all(b"+")?;
-                            self.stream.flush()?;
-                        }
-                        let s = String::from_utf8_lossy(&p);
-                        if s.starts_with('T') || s.starts_with('S') {
-                            return parse_stop_reply(&p);
-                        }
-                        if s.starts_with('W') || s.starts_with('X') {
-                            let raw = s.into_owned();
-                            return Ok(StopInfo { thread: None, stop_kind: StopKind::Other(raw.clone()), raw });
-                        }
-                        // Ignore other packets (e.g. notifications) while waiting.
+            match self.next_decoded()? {
+                Decoded::Packet(p) => {
+                    self.ack_packet()?;
+                    self.clear_resume_if_stop(&p);
+                    let s = String::from_utf8_lossy(&p);
+                    if s.starts_with('T') || s.starts_with('S') {
+                        return parse_stop_reply(&p);
                     }
-                    Decoded::Ack | Decoded::Nack | Decoded::Interrupt => {}
+                    if s.starts_with('W') || s.starts_with('X') {
+                        let raw = s.into_owned();
+                        return Ok(StopInfo { thread: None, stop_kind: StopKind::Other(raw.clone()), raw });
+                    }
+                    // Ignore other packets (e.g. notifications) while waiting.
                 }
+                Decoded::Ack | Decoded::Nack | Decoded::Interrupt => {}
             }
         }
     }
 
     /// Try to read a stop reply without blocking long; Ok(None) on timeout.
     pub fn try_wait_stop(&mut self, timeout: Duration) -> Result<Option<StopInfo>> {
-        match self.poll_packet(timeout)? {
-            None => Ok(None),
-            Some(p) => {
-                let s = String::from_utf8_lossy(&p);
-                if s.starts_with('T') || s.starts_with('S') {
-                    Ok(Some(parse_stop_reply(&p)?))
-                } else if s.starts_with('W') || s.starts_with('X') {
-                    let raw = s.into_owned();
-                    Ok(Some(StopInfo { thread: None, stop_kind: StopKind::Other(raw.clone()), raw }))
-                } else {
-                    // Not a stop reply; keep looking is caller's job.
-                    Ok(None)
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            // Always give poll_packet a tiny budget so we can keep scanning pending
+            // even when the wall-clock timeout has already elapsed.
+            let slice = remaining.max(Duration::from_millis(1));
+            match self.poll_packet(slice)? {
+                None => {
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                }
+                Some(p) => {
+                    let s = String::from_utf8_lossy(&p);
+                    if s.starts_with('T') || s.starts_with('S') {
+                        self.resume_in_flight = false;
+                        return Ok(Some(parse_stop_reply(&p)?));
+                    }
+                    if s.starts_with('W') || s.starts_with('X') {
+                        self.resume_in_flight = false;
+                        let raw = s.into_owned();
+                        return Ok(Some(StopInfo { thread: None, stop_kind: StopKind::Other(raw.clone()), raw }));
+                    }
+                    // Non-stop while waiting for a resume end: stash aside.
+                    // Do NOT push_front — that livelocks poll_packet on the same
+                    // packet and never reads the real stop from the socket.
+                    eprintln!("warning: unexpected packet while waiting for stop: {}", s);
+                    self.orphan_replies.push_back(p);
                 }
             }
         }
@@ -666,6 +757,24 @@ mod tests {
             }
         });
         (addr, rx)
+    }
+
+    #[test]
+    fn resume_in_flight_blocks_send_packet_until_stop() {
+        let (addr, _rx) = spawn_mock_stub();
+        let mut c = GdbRemote::connect(&addr.to_string()).unwrap();
+        c.handshake().unwrap();
+        assert!(!c.resume_in_flight());
+        c.step(Some(1)).unwrap();
+        assert!(c.resume_in_flight(), "vCont;s must arm resume_in_flight");
+        // Hg/m while running would steal the stop reply (the 9300… desync bug).
+        let err = c.send_packet(b"Hg1").unwrap_err();
+        assert!(err.to_string().contains("resume in flight"), "got: {}", err);
+        let stop = c.wait_stop().unwrap();
+        assert_eq!(stop.stop_kind, StopKind::SwBreak);
+        assert!(!c.resume_in_flight(), "stop must clear resume_in_flight");
+        // Now command packets work again.
+        c.set_thread(1).unwrap();
     }
 
     #[test]

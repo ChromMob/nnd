@@ -845,8 +845,8 @@ impl Symbols {
 
     pub fn list_lines_for_file(&self, path: &Path) -> Vec<LineInfo> {
         let mut res: Vec<LineInfo> = Vec::new();
-        let file_idx = match self.path_to_used_file.get(path) {
-            Some(i) => *i,
+        let file_idx = match self.find_used_file_idx(path) {
+            Some(i) => i,
             None => return res };
         for s in &self.shards {
             let mut i = s.line_to_addr.partition_point(|l| l.file_idx().unwrap() < file_idx);
@@ -856,6 +856,43 @@ impl Symbols {
             }
         }
         res
+    }
+
+    /// Look up a used source file by path, tolerating build intermediates:
+    /// debug info may say `count.c_S` while the user (or `--breakpoint`) says `count.c`.
+    pub fn find_used_file_idx(&self, path: &Path) -> Option<usize> {
+        if let Some(&i) = self.path_to_used_file.get(path) {
+            return Some(i);
+        }
+        let base = path.file_name()?.to_str()?.to_owned();
+        let alt_base = if let Some(stripped) = base.strip_suffix("_S") {
+            stripped.to_owned()
+        } else {
+            format!("{}_S", base)
+        };
+        let mut same_dir: Option<usize> = None;
+        let mut any: Option<usize> = None;
+        let mut count = 0usize;
+        for (p, &i) in &self.path_to_used_file {
+            let name = match p.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            if name != base && name != alt_base {
+                continue;
+            }
+            count += 1;
+            if any.is_none() {
+                any = Some(i);
+            }
+            if same_dir.is_none() && p.parent() == path.parent() {
+                same_dir = Some(i);
+            }
+        }
+        if count == 1 {
+            return any;
+        }
+        same_dir.or(any)
     }
 
     pub fn find_base_type(&self, offset: DieOffset) -> Result<ValueType> {

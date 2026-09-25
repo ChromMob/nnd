@@ -347,7 +347,8 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
                 Some(x) => x,
                 None => error!(ProcessState, "no valid DT_DEBUG found"),
             };
-            if !error.is_loading() {
+            // Static bare-metal remote ELFs never have DT_DEBUG — don't spam the log.
+            if !error.is_loading() && !debugger.mode.is_remote() {
                 eprintln!("warning: couldn't load r_debug: {}", error);
             }
             debugger.info.r_debug = Err(error);

@@ -30,7 +30,7 @@ pub struct LazyExtraRegisters {
 }
 
 #[repr(u8)]
-#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub enum RegisterIdx {
     // x86-64 registers.
     Rax = 0,
@@ -86,21 +86,31 @@ impl RegisterIdx {
                 _ => None,
             },
             crate::disasm::Arch::AArch64 => match r.0 {
-                0 => Some(RegisterIdx::Rax),
-                1 => Some(RegisterIdx::Ret),
-                8 => Some(RegisterIdx::Rbp),
-                29 => Some(RegisterIdx::Rbp),
-                30 => Some(RegisterIdx::Ret),
-                31 => Some(RegisterIdx::Rsp),
-                32 => Some(RegisterIdx::Rip),
+                0 => Some(RegisterIdx::Rax), // x0
+                1 => Some(RegisterIdx::Ret), // x1 / lr sometimes used
+                2 => Some(RegisterIdx::Rdx),
+                8 => Some(RegisterIdx::Rbp), // x8 / fp
+                29 => Some(RegisterIdx::Rbp), // x29 / fp
+                30 => Some(RegisterIdx::Ret), // x30 / lr
+                31 => Some(RegisterIdx::Rsp), // sp
+                32 => Some(RegisterIdx::Rip), // pc
                 _ => None,
             },
+            // RISC-V DWARF: x0-x31 = 0-31, pc = 32. Map the ones that have a
+            // slot in nnd's x86-shaped Registers; the rest (gp/tp/t*/s*) have no slot.
             crate::disasm::Arch::Riscv64 => match r.0 {
-                0 => Some(RegisterIdx::Rax),
-                1 => Some(RegisterIdx::Ret),
-                2 => Some(RegisterIdx::Rsp),
-                8 => Some(RegisterIdx::Rbp),
-                32 => Some(RegisterIdx::Rip),
+                1 => Some(RegisterIdx::Ret), // ra
+                2 => Some(RegisterIdx::Rsp), // sp
+                8 => Some(RegisterIdx::Rbp), // s0 / fp
+                10 => Some(RegisterIdx::Rax), // a0
+                11 => Some(RegisterIdx::Rdx), // a1
+                12 => Some(RegisterIdx::Rcx), // a2
+                13 => Some(RegisterIdx::Rbx), // a3
+                14 => Some(RegisterIdx::Rsi), // a4
+                15 => Some(RegisterIdx::Rdi), // a5
+                16 => Some(RegisterIdx::R8), // a6
+                17 => Some(RegisterIdx::R9), // a7
+                32 => Some(RegisterIdx::Rip), // pc
                 _ => None,
             },
         }

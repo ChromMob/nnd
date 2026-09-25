@@ -83,7 +83,14 @@ pub fn disassemble(arch: Arch, addr: u64, bytes: &[u8]) -> Insn {
         };
     }
     let text_end = raw.text.iter().position(|&b| b == 0).unwrap_or(raw.text.len());
-    let text = String::from_utf8_lossy(&raw.text[..text_end]).into_owned();
+    // Binutils separates mnemonic and operands with TAB (and can emit other C0
+    // controls). Those must never reach the TUI: tabs are written raw to the
+    // terminal and break the ANSI cursor stream; they also have width 0 so
+    // layout/draw disagree.
+    let text: String = String::from_utf8_lossy(&raw.text[..text_end])
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
     let mnemonic = text
         .split_whitespace()
         .next()
@@ -322,6 +329,24 @@ mod tests {
     }
 
     #[test]
+    fn text_has_no_control_chars() {
+        // Binutils uses TAB between mnemonic and operands; must not reach the TUI.
+        for bytes in ["13000000", "73000000", "30529073", "0890c0ef", "0ff0000f", "00008067", "63000000", "0100"] {
+            let insn = disassemble(Arch::Riscv64, 0x1000, &hex(bytes));
+            if insn.len == 0 {
+                continue;
+            }
+            assert!(
+                !insn.text.chars().any(|c| c.is_control()),
+                "control char in {:?}: {:?}",
+                insn.text,
+                insn.text.chars().filter(|c| c.is_control()).collect::<Vec<_>>()
+            );
+            // mnemonic split still works with spaces instead of tabs
+            assert!(!insn.mnemonic.is_empty() || insn.text.trim().is_empty(), "{:?}", insn);
+        }
+    }
+
     fn empty_is_invalid() {
         let insn = disassemble(Arch::X86_64, 0, &[]);
         assert_eq!(insn.len, 0);

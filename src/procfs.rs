@@ -353,6 +353,10 @@ impl RemoteMemReader {
             Ok(g) => g,
             Err(_) => return err!(ProcessState, "remote connection poisoned"),
         };
+        if conn.resume_in_flight() {
+            // Next stub bytes are the stop reply; an `m` here desyncs the stream.
+            return err!(ProcessState, "target is running; not reading remote memory");
+        }
         if self.tid != 0 {
             conn.set_thread(self.tid as u64).map_err(|e| Error::new(ErrorCode::ProcessState, format!("gdb remote: {}", e)))?;
         }

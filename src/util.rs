@@ -70,8 +70,13 @@ impl Epoll {
 
     // Returns Ok(0) on EINTR.
     pub fn wait(&self, out: &mut [libc::epoll_event]) -> Result<usize> {
+        self.wait_timeout(out, -1)
+    }
+
+    /// `timeout_ms` of -1 blocks forever; >=0 is a poll interval in milliseconds.
+    pub fn wait_timeout(&self, out: &mut [libc::epoll_event], timeout_ms: i32) -> Result<usize> {
         unsafe {
-            let r = libc::epoll_wait(self.fd, out.as_mut_ptr(), out.len() as i32, -1);
+            let r = libc::epoll_wait(self.fd, out.as_mut_ptr(), out.len() as i32, timeout_ms);
             if r < 0 {
                 if *libc::__errno_location() == libc::EINTR {
                     return Ok(0);
