@@ -11,22 +11,30 @@ Properties:
  * TUI.
  * Not based on gdb or lldb, implemented mostly from scratch.
  * Works on large executables.
+ * Native Linux x86-64 debugging, plus GDB-stub attach to QEMU guests (x86-64, aarch64, riscv64).
 
 What we mean by "fast":
  * Operations that can be instantaneous should be instantaneous. I.e. snappy UI, no random freezes, no long waits.
    (Known exception: if the program has >~2k threads things become pretty slow. This will be improved.)
  * Operations that can't be instantaneous (loading debug info, searching for functions and types) should be reasonably efficient, multi-threaded, asynchronous, cancellable, and have progress bars.
 
+Remote debugging (QEMU / GDB stub):
+
+nnd can attach to a GDB remote stub that you start yourself — typically a VM under QEMU:
+```bash
+qemu-system-riscv64 -s -S …          # -s = gdbstub on tcp::1234, -S = stop at reset
+nnd --remote 127.0.0.1:1234 vmlinux  # ELF path(s) provide symbols and memory maps
+```
+Same UI as native debugging: breakpoints (including watchpoints), stepping, stack traces, locals, and watches, driven over the GDB Remote Serial Protocol. Guests may be x86-64, aarch64, or riscv64 (disassembly via binutils libopcodes, same engine as GDB). nnd connects to the stub; it does not spawn or manage QEMU. nnd must still run on an x86-64 Linux host.
+
 Limitations:
- * Linux only (host); remote GDB-stub targets may be other architectures
- * x86-64 only for native ptrace debugging; remote mode accepts x86-64, aarch64, and riscv64 guests
+ * Linux only (host, x86-64)
  * 64-bit only
  * for native code only (e.g. C++, Rust, Zig, Odin, not Java or Python)
  * TUI only (no REPL, GUI, or IDE integration)
- * no remote *process* debugging over the network for local ptrace targets (works fine over ssh); GDB remote stub attach via `--remote host:port` (e.g. after `qemu-system-… -s -S`)
+ * no remote *process* debugging over the network for local ptrace targets (works fine over ssh); use `--remote host:port` for GDB stubs instead
  * single process (doesn't follow forks)
  * no record/replay or backwards stepping
- * disassembly uses binutils libopcodes (same engine as GDB), not a hand-rolled decoder
 
 Development status:
  * Most standard debugger features are there. E.g. breakpoints, conditional breakpoints, data breakpoints, stepping of all kinds, showing code and disassembly, watch expressions, built-in pretty-printers for most of C++ and Rust standard library. Many quality-of-life features are there (e.g. auto-downcasting abstract classes to concrete classes based on vtable). But I'm sure there are lots of missing features that I never needed but other people consider essential; let me know.
